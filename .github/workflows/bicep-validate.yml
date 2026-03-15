@@ -79,11 +79,15 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
+            const fs = require('fs');
             const result = '${{ steps.validation.outputs.result }}';
             const buildStatus = '${{ steps.validation.outputs.build_status }}';
             const lintStatus = '${{ steps.validation.outputs.lint_status }}';
-            const buildErrors = `${{ steps.validation.outputs.build_errors }}`.trim();
-            const lintErrors = `${{ steps.validation.outputs.lint_errors }}`.trim();
+
+            let buildErrors = '';
+            try { buildErrors = fs.readFileSync('build_errors.txt', 'utf8').trim(); } catch {}
+            let lintErrors = '';
+            try { lintErrors = fs.readFileSync('lint_errors.txt', 'utf8').trim(); } catch {}
 
             const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
             const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';

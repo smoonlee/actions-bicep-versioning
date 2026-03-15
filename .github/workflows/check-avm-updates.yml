@@ -76,6 +76,7 @@ jobs:
         if: steps.check.outputs.updates_found == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ secrets.PAT_TOKEN }}
           commit-message: "chore: update AVM Bicep module versions"
           branch: "chore/avm-module-updates"
           title: "chore: Update AVM Bicep module versions"

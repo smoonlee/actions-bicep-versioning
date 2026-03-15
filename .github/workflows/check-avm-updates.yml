@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  statuses: write
 
 jobs:
   check-updates:
@@ -109,6 +110,7 @@ jobs:
         run: bicep lint infra/main.bicep
 
       - name: Create Pull Request
+        id: create-pr
         if: steps.check.outputs.updates_found == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
@@ -120,3 +122,14 @@ jobs:
             dependencies
             bicep
           delete-branch: true
+
+      - name: Set Bicep Validate status on PR
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ steps.create-pr.outputs.pull-request-head-sha }} \
+            -f state=success \
+            -f context="Bicep Build & Lint" \
+            -f description="Bicep build and lint passed" \
+            -f target_url="$GITHUB_SERVER_URL/${{ github.repository }}/actions/runs/${{ github.run_id }}"

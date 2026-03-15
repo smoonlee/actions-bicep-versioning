@@ -151,6 +151,10 @@ jobs:
           echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
           echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
 
+          # Save errors to runner temp so they survive the PR creation checkout reset
+          cp build_errors.txt "$RUNNER_TEMP/build_errors.txt" 2>/dev/null || true
+          cp lint_errors.txt "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true
+
       - name: Create Pull Request
         id: create-pr
         if: steps.check.outputs.updates_found == 'true'
@@ -187,18 +191,22 @@ jobs:
       - name: Post validation comment on PR
         if: steps.create-pr.outputs.pull-request-number
         uses: actions/github-script@v8
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
         with:
           script: |
             const fs = require('fs');
+            const path = require('path');
+            const runnerTemp = process.env.RUNNER_TEMP;
             const prNumber = ${{ steps.create-pr.outputs.pull-request-number }};
             const result = '${{ steps.validation.outputs.result }}';
             const buildStatus = '${{ steps.validation.outputs.build_status }}';
             const lintStatus = '${{ steps.validation.outputs.lint_status }}';
 
             let buildErrors = '';
-            try { buildErrors = fs.readFileSync('build_errors.txt', 'utf8').trim(); } catch {}
+            try { buildErrors = fs.readFileSync(path.join(runnerTemp, 'build_errors.txt'), 'utf8').trim(); } catch {}
             let lintErrors = '';
-            try { lintErrors = fs.readFileSync('lint_errors.txt', 'utf8').trim(); } catch {}
+            try { lintErrors = fs.readFileSync(path.join(runnerTemp, 'lint_errors.txt'), 'utf8').trim(); } catch {}
 
             const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
             const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';
@@ -242,15 +250,6 @@ jobs:
                 repo: context.repo.repo,
                 comment_id: existing.id,
                 body
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                body
-              });
-            }
               });
             } else {
               await github.rest.issues.createComment({

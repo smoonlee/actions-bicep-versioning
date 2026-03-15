@@ -24,6 +24,8 @@ jobs:
           set -e
           TABLE_FILE=$(mktemp)
           SKIP_FILE=$(mktemp)
+          UPDATES_LIST="$RUNNER_TEMP/module_updates.txt"
+          > "$UPDATES_LIST"
           UPDATES_FOUND=false
           CURRENT_FILE=""
 
@@ -108,6 +110,9 @@ jobs:
             echo "  UPDATE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
             sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
 
+            # Record for change map step
+            echo "${MODULE_PATH}|${CURRENT_VERSION}|${LATEST_VERSION}" >> "$UPDATES_LIST"
+
             # Group by file — emit heading + table header when file changes
             if [ "$file" != "$CURRENT_FILE" ]; then
               [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
@@ -141,6 +146,12 @@ jobs:
 
           # Build PR body with the update table
           {
+            echo 'update_table<<EOF'
+            cat "$TABLE_FILE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
             echo 'pr_body<<EOF'
             echo 'Automated PR to update Azure Verified Module (AVM) references to the latest versions.'
             echo ''
@@ -161,6 +172,137 @@ jobs:
           chmod +x bicep
           sudo mv bicep /usr/local/bin/bicep
           bicep --version
+
+      # ---------------------------------------------------------------
+      # Build AVM change map from GitHub source
+      #
+      # For each updated module, fetch the old and new main.bicep from
+      # Azure/bicep-registry-modules, extract top-level param names,
+      # and diff them to surface breaking changes for manual review.
+      # ---------------------------------------------------------------
+      - name: Build AVM change map
+        id: changemap
+        if: steps.check.outputs.updates_found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CHANGE_MAP="$RUNNER_TEMP/avm_change_map.txt"
+          CHANGE_TABLE="$RUNNER_TEMP/avm_change_table.txt"
+          > "$CHANGE_MAP"
+          > "$CHANGE_TABLE"
+          UPDATES_LIST="$RUNNER_TEMP/module_updates.txt"
+          AVM_REPO="Azure/bicep-registry-modules"
+
+          if [ ! -s "$UPDATES_LIST" ]; then
+            echo "No module updates to process"
+            echo "change_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Deduplicate modules (same module may appear in multiple files)
+          sort -u "$UPDATES_LIST" > /tmp/unique_updates.txt
+
+          while IFS='|' read -r MODULE_PATH OLD_VER NEW_VER; do
+            [ -z "$MODULE_PATH" ] && continue
+
+            OLD_TAG="${MODULE_PATH}/${OLD_VER}"
+            NEW_TAG="${MODULE_PATH}/${NEW_VER}"
+
+            echo "::group::Change map: ${MODULE_PATH} ${OLD_VER} → ${NEW_VER}"
+
+            # Fetch old main.bicep from GitHub
+            OLD_BICEP=$(curl -sf \
+              "https://api.github.com/repos/${AVM_REPO}/contents/${MODULE_PATH}/main.bicep?ref=${OLD_TAG}" \
+              -H "Accept: application/vnd.github.raw+json" \
+              -H "Authorization: Bearer $GH_TOKEN" 2>/dev/null || echo "")
+
+            if [ -z "$OLD_BICEP" ]; then
+              echo "  Could not fetch old main.bicep for tag ${OLD_TAG}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Fetch new main.bicep
+            NEW_BICEP=$(curl -sf \
+              "https://api.github.com/repos/${AVM_REPO}/contents/${MODULE_PATH}/main.bicep?ref=${NEW_TAG}" \
+              -H "Accept: application/vnd.github.raw+json" \
+              -H "Authorization: Bearer $GH_TOKEN" 2>/dev/null || echo "")
+
+            if [ -z "$NEW_BICEP" ]; then
+              echo "  Could not fetch new main.bicep for tag ${NEW_TAG}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Extract top-level param names (sorted)
+            OLD_PARAMS=$(echo "$OLD_BICEP" | grep -P '^param\s+' | awk '{print $2}' | sort)
+            NEW_PARAMS=$(echo "$NEW_BICEP" | grep -P '^param\s+' | awk '{print $2}' | sort)
+
+            # Diff: removed params (in old, not in new)
+            REMOVED=$(comm -23 <(echo "$OLD_PARAMS") <(echo "$NEW_PARAMS"))
+            # Diff: added params (in new, not in old)
+            ADDED=$(comm -13 <(echo "$OLD_PARAMS") <(echo "$NEW_PARAMS"))
+
+            REMAINING_ADDED="$ADDED"
+
+            if [ -z "$REMOVED" ] && [ -z "$ADDED" ]; then
+              echo "  No parameter changes detected"
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "  Removed params: $(echo $REMOVED | tr '\n' ' ')"
+            echo "  Added params:   $(echo $ADDED | tr '\n' ' ')"
+
+            # Match removed → added to find renames
+            for OLD_P in $REMOVED; do
+              CAP="$(echo "${OLD_P:0:1}" | tr '[:lower:]' '[:upper:]')${OLD_P:1}"
+              MATCH=""
+
+              for NEW_P in $REMAINING_ADDED; do
+                case "$NEW_P" in *"$CAP") MATCH="$NEW_P"; break ;; esac
+              done
+
+              if [ -z "$MATCH" ]; then
+                for NEW_P in $REMAINING_ADDED; do
+                  if echo "$NEW_P" | grep -qi "$OLD_P"; then
+                    MATCH="$NEW_P"
+                    break
+                  fi
+                done
+              fi
+
+              if [ -n "$MATCH" ]; then
+                echo "  RENAME: ${OLD_P} → ${MATCH}"
+                echo "RENAME|${MODULE_PATH}|${OLD_P}|${MATCH}" >> "$CHANGE_MAP"
+                echo "| \`${MODULE_PATH}\` | Renamed | \`${OLD_P}\` | \`${MATCH}\` |" >> "$CHANGE_TABLE"
+                REMAINING_ADDED=$(echo "$REMAINING_ADDED" | grep -v "^${MATCH}$" || true)
+              else
+                echo "  REMOVE: ${OLD_P} (no matching new param)"
+                echo "REMOVE|${MODULE_PATH}|${OLD_P}|" >> "$CHANGE_MAP"
+                echo "| \`${MODULE_PATH}\` | Removed | \`${OLD_P}\` | — |" >> "$CHANGE_TABLE"
+              fi
+            done
+
+            for NEW_P in $REMAINING_ADDED; do
+              echo "  ADD: ${NEW_P} (new param)"
+              echo "ADD|${MODULE_PATH}||${NEW_P}" >> "$CHANGE_MAP"
+              echo "| \`${MODULE_PATH}\` | Added | — | \`${NEW_P}\` |" >> "$CHANGE_TABLE"
+            done
+
+            echo "::endgroup::"
+          done < /tmp/unique_updates.txt
+
+          CHANGE_COUNT=$(wc -l < "$CHANGE_MAP" 2>/dev/null | tr -d ' ')
+          echo "change_count=${CHANGE_COUNT:-0}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'change_table<<EOF'
+            cat "$CHANGE_TABLE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f /tmp/unique_updates.txt
 
       - name: Bicep Build
         id: bicep-build
@@ -251,6 +393,41 @@ jobs:
 
 
 
+      - name: Build PR body
+        id: pr-body
+        if: steps.check.outputs.updates_found == 'true'
+        run: |
+          CHANGE_COUNT="${{ steps.changemap.outputs.change_count }}"
+          VALIDATION="${{ steps.validation.outputs.result }}"
+
+          {
+            echo 'body<<EOF'
+            echo 'Automated PR to update Azure Verified Module (AVM) references to the latest versions.'
+            echo ''
+            echo '### Module Updates'
+            echo ''
+            echo '${{ steps.check.outputs.update_table }}'
+            echo ''
+
+            if [ "$CHANGE_COUNT" != "0" ] && [ "$CHANGE_COUNT" != "" ]; then
+              echo '### Parameter Changes Detected (from [AVM source](https://github.com/Azure/bicep-registry-modules/tree/main/avm))'
+              echo ''
+              echo 'Cross-referenced old and new module versions to identify parameter interface changes:'
+              echo ''
+              echo '| Module | Change | Old Parameter | New Parameter |'
+              echo '|--------|--------|---------------|---------------|'
+              echo '${{ steps.changemap.outputs.change_table }}'
+              echo ''
+            fi
+
+            if [ "$VALIDATION" = "success" ]; then
+              echo '> **All checks passed.** Module versions updated with no breaking changes detected. Please review before merging.'
+            else
+              echo '> **⚠️ Manual review required.** This PR updates module versions only — no auto-fix is applied. Breaking changes (renamed or removed parameters) may need to be resolved manually before merging.'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create Pull Request
         id: create-pr
         if: steps.check.outputs.updates_found == 'true'
@@ -259,7 +436,7 @@ jobs:
           commit-message: "chore: update AVM Bicep module versions"
           branch: "chore/avm-module-updates"
           title: "chore: Update AVM Bicep module versions"
-          body: ${{ steps.check.outputs.pr_body }}
+          body: ${{ steps.pr-body.outputs.body }}
           labels: |
             dependencies
             bicep
@@ -300,6 +477,7 @@ jobs:
             const lintStatus = '${{ steps.validation.outputs.lint_status }}';
 
             const affectedModules = '${{ steps.validation.outputs.affected_modules }}';
+            const changeCount = '${{ steps.changemap.outputs.change_count }}';
 
             // Strip runner workspace path prefix for cleaner output
             const stripPath = (s) => s.replace(/\/home\/runner\/work\/[^/]+\/[^/]+\//g, '');
@@ -324,6 +502,22 @@ jobs:
               `| Bicep Build | ${buildIcon} |`,
               `| Bicep Lint | ${lintIcon} |`,
             ];
+
+            // Parameter changes detected from AVM source
+            let changeMap = '';
+            try { changeMap = fs.readFileSync(path.join(runnerTemp, 'avm_change_map.txt'), 'utf8').trim(); } catch {}
+
+            if (changeMap) {
+              const changes = changeMap.split('\n').map(l => l.split('|'));
+              lines.push('', '### Parameter Changes Detected (from [AVM source](https://github.com/Azure/bicep-registry-modules/tree/main/avm))', '');
+              lines.push('| Module | Change | Old Parameter | New Parameter |');
+              lines.push('|--------|--------|---------------|---------------|');
+              for (const [action, mod, oldP, newP] of changes) {
+                const label = action === 'RENAME' ? 'Renamed' : action === 'REMOVE' ? 'Removed' : 'Added';
+                lines.push(`| \`${mod}\` | ${label} | \`${oldP || '—'}\` | \`${newP || '—'}\` |`);
+              }
+              lines.push('');
+            }
 
             if (affectedModules && result !== 'success') {
               const modules = affectedModules.split(',');

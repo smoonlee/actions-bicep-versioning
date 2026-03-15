@@ -1,0 +1,515 @@
+name: "Check AVM Module Auto-Update"
+
+on:
+  workflow_dispatch:
+  # Uncomment when ready to replace the manual check-avm-updates workflow:
+  # schedule:
+  #   - cron: "0 8 * * 1" # Every Monday at 08:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  auto-update:
+    name: "Auto-Update AVM Modules"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check for AVM module updates
+        id: check
+        run: |
+          set -e
+          TABLE_FILE=$(mktemp)
+          echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
+          echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
+
+          UPDATES_FOUND=false
+
+          while IFS= read -r match; do
+            file=$(echo "$match" | cut -d: -f1)
+            content=$(echo "$match" | cut -d: -f3-)
+
+            MODULE_REF=$(echo "$content" | grep -oP "br/public:avm/[^'\"]+")
+            if [ -z "$MODULE_REF" ]; then continue; fi
+
+            MODULE_PATH=$(echo "$MODULE_REF" | rev | cut -d: -f2- | rev | sed 's|br/public:||')
+            CURRENT_VERSION=$(echo "$MODULE_REF" | rev | cut -d: -f1 | rev)
+
+            REGISTRY_PATH="bicep/${MODULE_PATH}"
+            echo "Checking ${REGISTRY_PATH} (current: ${CURRENT_VERSION})"
+
+            TAGS_JSON=$(curl -sf "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/tags/list" 2>/dev/null || echo "")
+            if [ -z "$TAGS_JSON" ]; then
+              echo "  WARNING: Could not fetch tags for ${REGISTRY_PATH}"
+              continue
+            fi
+
+            LATEST_VERSION=$(echo "$TAGS_JSON" | jq -r '.tags[]' | sort -V | tail -n 1)
+            if [ -z "$LATEST_VERSION" ]; then
+              echo "  WARNING: No tags found for ${REGISTRY_PATH}"
+              continue
+            fi
+
+            echo "  Latest: ${LATEST_VERSION}"
+
+            if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+              echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+              sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
+              UPDATES_FOUND=true
+            fi
+          done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep")
+
+          if git diff --quiet; then
+            echo "updates_found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updates_found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo 'update_table<<EOF'
+            cat "$TABLE_FILE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f "$TABLE_FILE"
+
+      - name: Install Bicep CLI
+        if: steps.check.outputs.updates_found == 'true'
+        run: |
+          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+
+      # ---------------------------------------------------------------
+      # Auto-fix loop: parse Bicep errors and attempt property renames
+      #
+      # Strategy:
+      #   BCP037 = "property X is not allowed"  → property was REMOVED
+      #   BCP035 = "missing required property Y" → property was ADDED
+      #   If old name is a camelCase suffix of the new name (e.g. zone → availabilityZone),
+      #   rename in-place. Otherwise comment-out the removed property.
+      #   Repeat up to MAX_ATTEMPTS times to resolve cascading issues.
+      # ---------------------------------------------------------------
+      - name: Auto-fix breaking changes
+        id: autofix
+        if: steps.check.outputs.updates_found == 'true'
+        shell: bash
+        run: |
+          BICEP_FILE="infra/main.bicep"
+          MAX_ATTEMPTS=3
+          FIX_LOG="$RUNNER_TEMP/auto_fix_log.txt"
+          > "$FIX_LOG"
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "::group::Auto-fix attempt $attempt/$MAX_ATTEMPTS"
+
+            # Build and capture errors
+            ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
+
+            ERROR_COUNT=$(echo "$ERRORS" | grep -c ' : Error ' || true)
+            if [ "$ERROR_COUNT" -eq 0 ]; then
+              echo "No build errors — build is clean"
+              echo "::endgroup::"
+              break
+            fi
+            echo "Found $ERROR_COUNT error(s)"
+
+            # --- Parse BCP037: removed / not-allowed properties ---
+            echo "$ERRORS" | grep 'BCP037' > /tmp/bcp037.txt 2>/dev/null || true
+            > /tmp/removed.txt
+            while IFS= read -r errline; do
+              [ -z "$errline" ] && continue
+              LINENUM=$(echo "$errline" | grep -oP '\(\d+,' | head -1 | grep -oP '\d+')
+              PROP=$(echo "$errline" | grep -oP 'The property "\K[^"]+')
+              [ -n "$LINENUM" ] && [ -n "$PROP" ] && echo "${LINENUM}:${PROP}" >> /tmp/removed.txt
+            done < /tmp/bcp037.txt
+
+            # --- Parse BCP035: missing required properties ---
+            echo "$ERRORS" | grep 'BCP035' > /tmp/bcp035.txt 2>/dev/null || true
+            > /tmp/missing.txt
+            while IFS= read -r errline; do
+              [ -z "$errline" ] && continue
+              echo "$errline" | sed 's/.*required properties: //' | grep -oP '"[^"]+"' | tr -d '"'
+            done < /tmp/bcp035.txt | sort -u > /tmp/missing.txt
+
+            echo "  Removed properties (BCP037):" && cat /tmp/removed.txt 2>/dev/null || true
+            echo "  Missing properties (BCP035):" && cat /tmp/missing.txt 2>/dev/null || true
+
+            FIXED=0
+
+            # --- Match removed properties to missing ones ---
+            while IFS=: read -r LINENUM OLD_PROP; do
+              [ -z "$OLD_PROP" ] && continue
+              CAPITALISED="$(echo "${OLD_PROP:0:1}" | tr '[:lower:]' '[:upper:]')${OLD_PROP:1}"
+              MATCH=""
+
+              # Pass 1 — camelCase suffix (most precise, e.g. zone → availabilityZone)
+              while IFS= read -r MISS; do
+                [ -z "$MISS" ] && continue
+                case "$MISS" in *"$CAPITALISED") MATCH="$MISS"; break ;; esac
+              done < /tmp/missing.txt
+
+              # Pass 2 — case-insensitive substring
+              if [ -z "$MATCH" ]; then
+                while IFS= read -r MISS; do
+                  [ -z "$MISS" ] && continue
+                  if echo "$MISS" | grep -qi "$OLD_PROP"; then
+                    MATCH="$MISS"
+                    break
+                  fi
+                done < /tmp/missing.txt
+              fi
+
+              if [ -n "$MATCH" ]; then
+                echo "    RENAME: '$OLD_PROP' → '$MATCH' (line $LINENUM)"
+                sed -i "${LINENUM}s/^\([[:space:]]*\)${OLD_PROP}:/\1${MATCH}:/" "$BICEP_FILE"
+                echo "RENAME|${OLD_PROP}|${MATCH}|${LINENUM}" >> "$FIX_LOG"
+                # Remove matched property from the missing list
+                grep -v "^${MATCH}$" /tmp/missing.txt > /tmp/missing_new.txt 2>/dev/null || true
+                mv /tmp/missing_new.txt /tmp/missing.txt
+                FIXED=$((FIXED + 1))
+              else
+                echo "    COMMENT OUT: '$OLD_PROP' (line $LINENUM) — no replacement found"
+                sed -i "${LINENUM}s|^\([[:space:]]*\)\(.*\)|\1// [auto-removed] \2|" "$BICEP_FILE"
+                echo "REMOVE|${OLD_PROP}||${LINENUM}" >> "$FIX_LOG"
+                FIXED=$((FIXED + 1))
+              fi
+            done < /tmp/removed.txt
+
+            # Log any remaining unresolved missing properties
+            while IFS= read -r MISS; do
+              [ -z "$MISS" ] && continue
+              if ! grep -q "UNRESOLVED|${MISS}|" "$FIX_LOG" 2>/dev/null; then
+                echo "    UNRESOLVED: missing required property '$MISS'"
+                echo "UNRESOLVED|${MISS}||" >> "$FIX_LOG"
+              fi
+            done < /tmp/missing.txt
+
+            echo "::endgroup::"
+
+            if [ "$FIXED" -eq 0 ]; then
+              echo "No more auto-fixes available"
+              break
+            fi
+            echo "Applied $FIXED fix(es) — re-validating..."
+          done
+
+          # Determine auto-fix outcome
+          FINAL_ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
+          FINAL_ERROR_COUNT=$(echo "$FINAL_ERRORS" | grep -c ' : Error ' || true)
+
+          if [ "$FINAL_ERROR_COUNT" -eq 0 ]; then
+            echo "auto_fix_result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "auto_fix_result=partial" >> "$GITHUB_OUTPUT"
+          fi
+
+          FIX_COUNT=$(grep -c '^RENAME\|^REMOVE' "$FIX_LOG" 2>/dev/null || echo "0")
+          echo "fix_count=$FIX_COUNT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'fix_log<<EOF'
+            cat "$FIX_LOG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f /tmp/bcp037.txt /tmp/bcp035.txt /tmp/removed.txt /tmp/missing.txt
+
+      # --- Final validation after auto-fix ---
+      - name: Bicep Build (final)
+        id: bicep-build
+        if: steps.check.outputs.updates_found == 'true'
+        continue-on-error: true
+        run: bicep build infra/main.bicep --stdout > /dev/null 2> build_errors.txt
+
+      - name: Bicep Lint (final)
+        id: bicep-lint
+        if: steps.check.outputs.updates_found == 'true'
+        continue-on-error: true
+        run: bicep lint infra/main.bicep 2> lint_errors.txt
+
+      - name: Capture validation results
+        id: validation
+        if: steps.check.outputs.updates_found == 'true'
+        run: |
+          BUILD_STATUS="${{ steps.bicep-build.outcome }}"
+          LINT_STATUS="${{ steps.bicep-lint.outcome }}"
+
+          BUILD_ERRORS=""
+          if [ -f build_errors.txt ] && [ -s build_errors.txt ]; then
+            BUILD_ERRORS=$(cat build_errors.txt)
+          fi
+
+          LINT_ERRORS=""
+          if [ -f lint_errors.txt ] && [ -s lint_errors.txt ]; then
+            LINT_ERRORS=$(cat lint_errors.txt)
+          fi
+
+          if [ "$BUILD_STATUS" = "success" ] && [ "$LINT_STATUS" = "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo 'build_errors<<EOF'
+            echo "$BUILD_ERRORS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'lint_errors<<EOF'
+            echo "$LINT_ERRORS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
+          echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
+
+          # Map error line numbers to module names
+          AFFECTED_MODULES=""
+          if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
+            ERROR_LINES=$(grep -ohP '\((\d+),' build_errors.txt lint_errors.txt 2>/dev/null | grep -oP '\d+' | sort -un)
+            MODULE_STARTS=$(grep -n '^module ' infra/main.bicep | sed 's/:module \([^ ]*\).*/:\1/')
+
+            for ERR_LINE in $ERROR_LINES; do
+              MATCHED_MODULE=""
+              MATCHED_START=0
+              while IFS=: read -r MOD_LINE MOD_NAME; do
+                if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
+                  MATCHED_MODULE="$MOD_NAME"
+                  MATCHED_START=$MOD_LINE
+                fi
+              done <<< "$MODULE_STARTS"
+              if [ -n "$MATCHED_MODULE" ]; then
+                AFFECTED_MODULES="$AFFECTED_MODULES $MATCHED_MODULE"
+              fi
+            done
+            AFFECTED_MODULES=$(echo "$AFFECTED_MODULES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+          fi
+          echo "affected_modules=$AFFECTED_MODULES" >> "$GITHUB_OUTPUT"
+
+          cp build_errors.txt "$RUNNER_TEMP/build_errors.txt" 2>/dev/null || true
+          cp lint_errors.txt "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true
+
+      - name: Build PR body
+        id: pr-body
+        if: steps.check.outputs.updates_found == 'true'
+        run: |
+          AUTO_RESULT="${{ steps.autofix.outputs.auto_fix_result }}"
+          FIX_COUNT="${{ steps.autofix.outputs.fix_count }}"
+          VALIDATION="${{ steps.validation.outputs.result }}"
+
+          {
+            echo 'body<<EOF'
+            echo 'Automated PR to update Azure Verified Module (AVM) references to the latest versions.'
+            echo ''
+            echo '### Module Updates'
+            echo ''
+            echo '${{ steps.check.outputs.update_table }}'
+            echo ''
+
+            # Auto-fix summary
+            if [ "$FIX_COUNT" != "0" ]; then
+              echo '### Auto-Fix Summary'
+              echo ''
+              echo 'The following breaking changes were automatically resolved:'
+              echo ''
+              echo '| Action | Old Property | New Property | Line |'
+              echo '|--------|-------------|--------------|------|'
+              while IFS='|' read -r ACTION OLD NEW LINE; do
+                case "$ACTION" in
+                  RENAME)  echo "| Renamed | \`${OLD}\` | \`${NEW}\` | ${LINE} |" ;;
+                  REMOVE)  echo "| Commented out | \`${OLD}\` | — | ${LINE} |" ;;
+                esac
+              done <<< '${{ steps.autofix.outputs.fix_log }}'
+              echo ''
+            fi
+
+            # Unresolved items
+            UNRESOLVED=$(echo '${{ steps.autofix.outputs.fix_log }}' | grep '^UNRESOLVED' || true)
+            if [ -n "$UNRESOLVED" ]; then
+              echo '### Unresolved Changes'
+              echo ''
+              echo 'The following new required properties could not be auto-resolved:'
+              echo ''
+              echo "$UNRESOLVED" | while IFS='|' read -r _ PROP _ _; do
+                echo "- \`${PROP}\`"
+              done
+              echo ''
+            fi
+
+            if [ "$VALIDATION" = "success" ]; then
+              echo '> **All checks passed.** This PR is ready for review.'
+            else
+              echo '> **⚠️ Manual intervention required.** Some breaking changes could not be auto-resolved. Please review the validation comment for details.'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          # Dynamic PR title
+          if [ "$VALIDATION" = "success" ]; then
+            echo "title=chore: Auto-update AVM Bicep module versions" >> "$GITHUB_OUTPUT"
+          else
+            echo "title=chore: Auto-update AVM Bicep module versions (needs manual fixes)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Pull Request
+        id: create-pr
+        if: steps.check.outputs.updates_found == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: "chore: auto-update AVM Bicep module versions"
+          branch: "chore/avm-module-auto-updates"
+          title: ${{ steps.pr-body.outputs.title }}
+          body: ${{ steps.pr-body.outputs.body }}
+          labels: |
+            dependencies
+            bicep
+          delete-branch: true
+
+      - name: Set Bicep Validate status on PR
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESULT="${{ steps.validation.outputs.result }}"
+          if [ "$RESULT" = "success" ]; then
+            STATE="success"
+            DESC="Bicep build and lint passed (auto-fixed)"
+          else
+            STATE="failure"
+            DESC="Bicep validation failed — manual intervention required"
+          fi
+          gh api repos/${{ github.repository }}/statuses/${{ steps.create-pr.outputs.pull-request-head-sha }} \
+            -f state="$STATE" \
+            -f context="Bicep Build & Lint" \
+            -f description="$DESC" \
+            -f target_url="$GITHUB_SERVER_URL/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Post validation comment on PR
+        if: steps.create-pr.outputs.pull-request-number
+        uses: actions/github-script@v8
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const runnerTemp = process.env.RUNNER_TEMP;
+            const prNumber = ${{ steps.create-pr.outputs.pull-request-number }};
+            const result = '${{ steps.validation.outputs.result }}';
+            const buildStatus = '${{ steps.validation.outputs.build_status }}';
+            const lintStatus = '${{ steps.validation.outputs.lint_status }}';
+            const affectedModules = '${{ steps.validation.outputs.affected_modules }}';
+            const autoResult = '${{ steps.autofix.outputs.auto_fix_result }}';
+            const fixCount = '${{ steps.autofix.outputs.fix_count }}';
+
+            const stripPath = (s) => s.replace(/\/home\/runner\/work\/[^/]+\/[^/]+\//g, '');
+
+            let buildErrors = '';
+            try { buildErrors = stripPath(fs.readFileSync(path.join(runnerTemp, 'build_errors.txt'), 'utf8').trim()); } catch {}
+            let lintErrors = '';
+            try { lintErrors = stripPath(fs.readFileSync(path.join(runnerTemp, 'lint_errors.txt'), 'utf8').trim()); } catch {}
+
+            // Parse auto-fix log
+            let fixLog = '';
+            try { fixLog = fs.readFileSync(path.join(runnerTemp, 'auto_fix_log.txt'), 'utf8').trim(); } catch {}
+
+            const renames = [];
+            const removals = [];
+            const unresolved = [];
+            if (fixLog) {
+              for (const line of fixLog.split('\n')) {
+                const parts = line.split('|');
+                if (parts[0] === 'RENAME')     renames.push({ old: parts[1], new: parts[2], line: parts[3] });
+                if (parts[0] === 'REMOVE')     removals.push({ old: parts[1], line: parts[3] });
+                if (parts[0] === 'UNRESOLVED') unresolved.push({ prop: parts[1] });
+              }
+            }
+
+            const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
+            const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';
+            const heading = result === 'success'
+              ? '## Bicep Validation Passed — Auto-Fix Successful'
+              : '## Bicep Validation Failed — Manual Intervention Required';
+
+            const lines = [
+              '<!-- bicep-validate-comment -->',
+              heading,
+              '',
+              '| Check | Status |',
+              '|-------|--------|',
+              `| Bicep Build | ${buildIcon} |`,
+              `| Bicep Lint | ${lintIcon} |`,
+            ];
+
+            // Auto-fix changes
+            if (renames.length > 0 || removals.length > 0) {
+              lines.push('', '### Auto-Fix Changes', '');
+              lines.push('| Action | Old Property | New Property | Line |');
+              lines.push('|--------|-------------|--------------|------|');
+              for (const r of renames) {
+                lines.push(`| Renamed | \`${r.old}\` | \`${r.new}\` | ${r.line} |`);
+              }
+              for (const r of removals) {
+                lines.push(`| Commented out | \`${r.old}\` | — | ${r.line} |`);
+              }
+            }
+
+            // Unresolved
+            if (unresolved.length > 0) {
+              lines.push('', '### Unresolved — Needs Manual Fix', '');
+              for (const u of unresolved) {
+                lines.push(`- Missing required property: \`${u.prop}\``);
+              }
+            }
+
+            // Affected modules
+            if (affectedModules && result !== 'success') {
+              const modules = affectedModules.split(',');
+              lines.push('', '### Affected Modules', '');
+              modules.forEach(m => lines.push(`- \`${m}\``));
+            }
+
+            if (buildErrors) {
+              lines.push('', '### Build Errors', '', '```', buildErrors, '```');
+            }
+            if (lintErrors) {
+              lines.push('', '### Lint Warnings / Errors', '', '```', lintErrors, '```');
+            }
+            if (result !== 'success') {
+              lines.push('', '> **Note:** The updated module versions introduced breaking changes that could not be fully auto-resolved. Please fix the remaining issues manually before merging.');
+            }
+
+            lines.push('', `Validated at \`${new Date().toISOString()}\` by [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`);
+
+            const body = lines.join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            const marker = '<!-- bicep-validate-comment -->';
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body
+              });
+            }

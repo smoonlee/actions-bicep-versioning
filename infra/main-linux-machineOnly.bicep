@@ -124,7 +124,7 @@ module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.21.0' =
     location: location
     osType: 'Linux'
     vmSize: 'Standard_B2ms'
-    availabilityZone: 0
+    availabilityZone: -1
     bootDiagnostics: true
     secureBootEnabled: true
     encryptionAtHost: true

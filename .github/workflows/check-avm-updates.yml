@@ -151,6 +151,29 @@ jobs:
           echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
           echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
 
+          # Map error line numbers to module names
+          AFFECTED_MODULES=""
+          if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
+            ERROR_LINES=$(grep -ohP '\((\d+),' build_errors.txt lint_errors.txt 2>/dev/null | grep -oP '\d+' | sort -un)
+            MODULE_STARTS=$(grep -n '^module ' infra/main.bicep | sed 's/:module \([^ ]*\).*/:\1/')
+
+            for ERR_LINE in $ERROR_LINES; do
+              MATCHED_MODULE=""
+              MATCHED_START=0
+              while IFS=: read -r MOD_LINE MOD_NAME; do
+                if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
+                  MATCHED_MODULE="$MOD_NAME"
+                  MATCHED_START=$MOD_LINE
+                fi
+              done <<< "$MODULE_STARTS"
+              if [ -n "$MATCHED_MODULE" ]; then
+                AFFECTED_MODULES="$AFFECTED_MODULES $MATCHED_MODULE"
+              fi
+            done
+            AFFECTED_MODULES=$(echo "$AFFECTED_MODULES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+          fi
+          echo "affected_modules=$AFFECTED_MODULES" >> "$GITHUB_OUTPUT"
+
           # Save errors to runner temp so they survive the PR creation checkout reset
           cp build_errors.txt "$RUNNER_TEMP/build_errors.txt" 2>/dev/null || true
           cp lint_errors.txt "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true
@@ -203,10 +226,15 @@ jobs:
             const buildStatus = '${{ steps.validation.outputs.build_status }}';
             const lintStatus = '${{ steps.validation.outputs.lint_status }}';
 
+            const affectedModules = '${{ steps.validation.outputs.affected_modules }}';
+
+            // Strip runner workspace path prefix for cleaner output
+            const stripPath = (s) => s.replace(/\/home\/runner\/work\/[^/]+\/[^/]+\//g, '');
+
             let buildErrors = '';
-            try { buildErrors = fs.readFileSync(path.join(runnerTemp, 'build_errors.txt'), 'utf8').trim(); } catch {}
+            try { buildErrors = stripPath(fs.readFileSync(path.join(runnerTemp, 'build_errors.txt'), 'utf8').trim()); } catch {}
             let lintErrors = '';
-            try { lintErrors = fs.readFileSync(path.join(runnerTemp, 'lint_errors.txt'), 'utf8').trim(); } catch {}
+            try { lintErrors = stripPath(fs.readFileSync(path.join(runnerTemp, 'lint_errors.txt'), 'utf8').trim()); } catch {}
 
             const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
             const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';
@@ -223,6 +251,12 @@ jobs:
               `| Bicep Build | ${buildIcon} |`,
               `| Bicep Lint | ${lintIcon} |`,
             ];
+
+            if (affectedModules && result !== 'success') {
+              const modules = affectedModules.split(',');
+              lines.push('', '### Affected Modules', '');
+              modules.forEach(m => lines.push(`- \`${m}\``));
+            }
 
             if (buildErrors) {
               lines.push('', '### Build Errors', '', '```', buildErrors, '```');

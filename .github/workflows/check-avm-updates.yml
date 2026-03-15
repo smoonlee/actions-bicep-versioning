@@ -23,10 +23,8 @@ jobs:
         run: |
           set -e
           TABLE_FILE=$(mktemp)
-          echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
-          echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
-
           UPDATES_FOUND=false
+          CURRENT_FILE=""
 
           # Find all Bicep files with AVM module references
           while IFS= read -r match; do
@@ -66,10 +64,21 @@ jobs:
             if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
               echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
               sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+
+              # Group by file — emit heading + table header when file changes
+              if [ "$file" != "$CURRENT_FILE" ]; then
+                [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
+                echo "#### \`./${file}\`" >> "$TABLE_FILE"
+                echo "" >> "$TABLE_FILE"
+                echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
+                echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
+                CURRENT_FILE="$file"
+              fi
+
               echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
               UPDATES_FOUND=true
             fi
-          done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep")
+          done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep" | sort -t: -k1,1 -k2,2n)
 
           # Detect changes via git
           if git diff --quiet; then

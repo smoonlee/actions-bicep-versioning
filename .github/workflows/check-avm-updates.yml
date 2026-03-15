@@ -23,8 +23,21 @@ jobs:
         run: |
           set -e
           TABLE_FILE=$(mktemp)
+          SKIP_FILE=$(mktemp)
           UPDATES_FOUND=false
           CURRENT_FILE=""
+
+          # ── Helper: compare two semver strings ──
+          # Returns 0 if $1 > $2, 1 otherwise
+          semver_gt() {
+            local IFS=.
+            local i a=($1) b=($2)
+            for ((i=0; i<3; i++)); do
+              [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 0
+              [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 1
+            done
+            return 1  # equal
+          }
 
           # Find all Bicep files with AVM module references
           while IFS= read -r match; do
@@ -45,40 +58,79 @@ jobs:
             REGISTRY_PATH="bicep/${MODULE_PATH}"
             echo "Checking ${REGISTRY_PATH} (current: ${CURRENT_VERSION})"
 
+            # ── Cross-check 1: Validate current version is valid semver ──
+            if ! echo "$CURRENT_VERSION" | grep -qP '^\d+\.\d+\.\d+$'; then
+              echo "  SKIP: Current version '${CURRENT_VERSION}' is not valid semver"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — invalid current version |" >> "$SKIP_FILE"
+              continue
+            fi
+
+            # ── Fetch available tags from MCR ──
             TAGS_JSON=$(curl -sf "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/tags/list" 2>/dev/null || echo "")
             if [ -z "$TAGS_JSON" ]; then
-              echo "  WARNING: Could not fetch tags for ${REGISTRY_PATH}"
+              echo "  SKIP: Could not fetch tags for ${REGISTRY_PATH}"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — registry unreachable |" >> "$SKIP_FILE"
               continue
             fi
 
-            # Get the latest semver tag (sort by version)
-            LATEST_VERSION=$(echo "$TAGS_JSON" | jq -r '.tags[]' | sort -V | tail -n 1)
-
-            if [ -z "$LATEST_VERSION" ]; then
-              echo "  WARNING: No tags found for ${REGISTRY_PATH}"
+            # ── Cross-check 2: Filter to stable semver tags only (no pre-release) ──
+            STABLE_TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -P '^\d+\.\d+\.\d+$' || true)
+            if [ -z "$STABLE_TAGS" ]; then
+              echo "  SKIP: No stable release tags found for ${REGISTRY_PATH}"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — no stable tags |" >> "$SKIP_FILE"
               continue
             fi
 
-            echo "  Latest: ${LATEST_VERSION}"
+            LATEST_VERSION=$(echo "$STABLE_TAGS" | sort -V | tail -n 1)
+            echo "  Latest stable: ${LATEST_VERSION}"
 
-            if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-              echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
-              sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
-
-              # Group by file — emit heading + table header when file changes
-              if [ "$file" != "$CURRENT_FILE" ]; then
-                [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
-                echo "#### \`./${file}\`" >> "$TABLE_FILE"
-                echo "" >> "$TABLE_FILE"
-                echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
-                echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
-                CURRENT_FILE="$file"
-              fi
-
-              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
-              UPDATES_FOUND=true
+            # ── Cross-check 3: Ensure it's actually newer (not a downgrade) ──
+            if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
+              echo "  Already on latest"
+              continue
             fi
+            if ! semver_gt "$LATEST_VERSION" "$CURRENT_VERSION"; then
+              echo "  SKIP: Latest '${LATEST_VERSION}' is not newer than current '${CURRENT_VERSION}'"
+              continue
+            fi
+
+            # ── Cross-check 4: Verify the module manifest exists at the target version ──
+            MANIFEST_CHECK=$(curl -sf -o /dev/null -w "%{http_code}" \
+              "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/manifests/${LATEST_VERSION}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" 2>/dev/null || echo "000")
+            if [ "$MANIFEST_CHECK" != "200" ]; then
+              echo "  SKIP: Manifest not found for ${REGISTRY_PATH}:${LATEST_VERSION} (HTTP ${MANIFEST_CHECK})"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — manifest not found (\`${LATEST_VERSION}\`) |" >> "$SKIP_FILE"
+              continue
+            fi
+            echo "  Manifest verified for ${REGISTRY_PATH}:${LATEST_VERSION}"
+
+            echo "  UPDATE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+            sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+
+            # Group by file — emit heading + table header when file changes
+            if [ "$file" != "$CURRENT_FILE" ]; then
+              [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
+              echo "#### \`./${file}\`" >> "$TABLE_FILE"
+              echo "" >> "$TABLE_FILE"
+              echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
+              echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
+              CURRENT_FILE="$file"
+            fi
+
+            echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
+            UPDATES_FOUND=true
           done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep" | sort -t: -k1,1 -k2,2n)
+
+          # Append skipped modules if any
+          if [ -s "$SKIP_FILE" ]; then
+            echo "" >> "$TABLE_FILE"
+            echo "#### Skipped Modules" >> "$TABLE_FILE"
+            echo "" >> "$TABLE_FILE"
+            echo "| Module | Current Version | Reason |" >> "$TABLE_FILE"
+            echo "|--------|-----------------|--------|" >> "$TABLE_FILE"
+            cat "$SKIP_FILE" >> "$TABLE_FILE"
+          fi
 
           # Detect changes via git
           if git diff --quiet; then

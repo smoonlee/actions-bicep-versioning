@@ -24,8 +24,23 @@ jobs:
         run: |
           set -e
           TABLE_FILE=$(mktemp)
+          SKIP_FILE=$(mktemp)
+          UPDATES_LIST="$RUNNER_TEMP/module_updates.txt"
+          > "$UPDATES_LIST"
           UPDATES_FOUND=false
           CURRENT_FILE=""
+
+          # ── Helper: compare two semver strings ──
+          # Returns 0 if $1 > $2, 1 otherwise
+          semver_gt() {
+            local IFS=.
+            local i a=($1) b=($2)
+            for ((i=0; i<3; i++)); do
+              [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 0
+              [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 1
+            done
+            return 1  # equal
+          }
 
           while IFS= read -r match; do
             file=$(echo "$match" | cut -d: -f1)
@@ -40,38 +55,82 @@ jobs:
             REGISTRY_PATH="bicep/${MODULE_PATH}"
             echo "Checking ${REGISTRY_PATH} (current: ${CURRENT_VERSION})"
 
+            # ── Cross-check 1: Validate current version is valid semver ──
+            if ! echo "$CURRENT_VERSION" | grep -qP '^\d+\.\d+\.\d+$'; then
+              echo "  SKIP: Current version '${CURRENT_VERSION}' is not valid semver"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — invalid current version |" >> "$SKIP_FILE"
+              continue
+            fi
+
+            # ── Fetch available tags from MCR ──
             TAGS_JSON=$(curl -sf "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/tags/list" 2>/dev/null || echo "")
             if [ -z "$TAGS_JSON" ]; then
-              echo "  WARNING: Could not fetch tags for ${REGISTRY_PATH}"
+              echo "  SKIP: Could not fetch tags for ${REGISTRY_PATH}"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — registry unreachable |" >> "$SKIP_FILE"
               continue
             fi
 
-            LATEST_VERSION=$(echo "$TAGS_JSON" | jq -r '.tags[]' | sort -V | tail -n 1)
-            if [ -z "$LATEST_VERSION" ]; then
-              echo "  WARNING: No tags found for ${REGISTRY_PATH}"
+            # ── Cross-check 2: Filter to stable semver tags only (no pre-release) ──
+            STABLE_TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -P '^\d+\.\d+\.\d+$' || true)
+            if [ -z "$STABLE_TAGS" ]; then
+              echo "  SKIP: No stable release tags found for ${REGISTRY_PATH}"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — no stable tags |" >> "$SKIP_FILE"
               continue
             fi
 
-            echo "  Latest: ${LATEST_VERSION}"
+            LATEST_VERSION=$(echo "$STABLE_TAGS" | sort -V | tail -n 1)
+            echo "  Latest stable: ${LATEST_VERSION}"
 
-            if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-              echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
-              sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
-
-              # Group by file — emit heading + table header when file changes
-              if [ "$file" != "$CURRENT_FILE" ]; then
-                [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
-                echo "#### \`./${file}\`" >> "$TABLE_FILE"
-                echo "" >> "$TABLE_FILE"
-                echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
-                echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
-                CURRENT_FILE="$file"
-              fi
-
-              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
-              UPDATES_FOUND=true
+            # ── Cross-check 3: Ensure it's actually newer (not a downgrade) ──
+            if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
+              echo "  Already on latest"
+              continue
             fi
+            if ! semver_gt "$LATEST_VERSION" "$CURRENT_VERSION"; then
+              echo "  SKIP: Latest '${LATEST_VERSION}' is not newer than current '${CURRENT_VERSION}'"
+              continue
+            fi
+
+            # ── Cross-check 4: Verify the module manifest exists at the target version ──
+            MANIFEST_CHECK=$(curl -sf -o /dev/null -w "%{http_code}" \
+              "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/manifests/${LATEST_VERSION}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" 2>/dev/null || echo "000")
+            if [ "$MANIFEST_CHECK" != "200" ]; then
+              echo "  SKIP: Manifest not found for ${REGISTRY_PATH}:${LATEST_VERSION} (HTTP ${MANIFEST_CHECK})"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | Skipped — manifest not found (\`${LATEST_VERSION}\`) |" >> "$SKIP_FILE"
+              continue
+            fi
+            echo "  Manifest verified for ${REGISTRY_PATH}:${LATEST_VERSION}"
+
+            echo "  UPDATE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+            sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+
+            # Record for change map step (machine-readable)
+            echo "${MODULE_PATH}|${CURRENT_VERSION}|${LATEST_VERSION}" >> "$UPDATES_LIST"
+
+            # Group by file — emit heading + table header when file changes
+            if [ "$file" != "$CURRENT_FILE" ]; then
+              [ -n "$CURRENT_FILE" ] && echo "" >> "$TABLE_FILE"
+              echo "#### \`./${file}\`" >> "$TABLE_FILE"
+              echo "" >> "$TABLE_FILE"
+              echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
+              echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
+              CURRENT_FILE="$file"
+            fi
+
+            echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
+            UPDATES_FOUND=true
           done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep" | sort -t: -k1,1 -k2,2n)
+
+          # Append skipped modules if any
+          if [ -s "$SKIP_FILE" ]; then
+            echo "" >> "$TABLE_FILE"
+            echo "#### Skipped Modules" >> "$TABLE_FILE"
+            echo "" >> "$TABLE_FILE"
+            echo "| Module | Current Version | Reason |" >> "$TABLE_FILE"
+            echo "|--------|-----------------|--------|" >> "$TABLE_FILE"
+            cat "$SKIP_FILE" >> "$TABLE_FILE"
+          fi
 
           if git diff --quiet; then
             echo "updates_found=false" >> "$GITHUB_OUTPUT"
@@ -85,7 +144,7 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-          rm -f "$TABLE_FILE"
+          rm -f "$TABLE_FILE" "$SKIP_FILE"
 
       - name: Install Bicep CLI
         if: steps.check.outputs.updates_found == 'true'
@@ -96,14 +155,155 @@ jobs:
           bicep --version
 
       # ---------------------------------------------------------------
-      # Auto-fix loop: parse Bicep errors and attempt property renames
+      # Build AVM change map from GitHub source
       #
-      # Strategy:
-      #   BCP037 = "property X is not allowed"  → property was REMOVED
-      #   BCP035 = "missing required property Y" → property was ADDED
-      #   If old name is a camelCase suffix of the new name (e.g. zone → availabilityZone),
-      #   rename in-place. Otherwise comment-out the removed property.
-      #   Repeat up to MAX_ATTEMPTS times to resolve cascading issues.
+      # For each updated module, fetch the old and new main.bicep from
+      # Azure/bicep-registry-modules, extract top-level param names,
+      # and diff them to produce a precise rename/remove/add map.
+      # This gives us a known-good source of truth instead of guessing
+      # from BCP error messages alone.
+      # ---------------------------------------------------------------
+      - name: Build AVM change map
+        id: changemap
+        if: steps.check.outputs.updates_found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CHANGE_MAP="$RUNNER_TEMP/avm_change_map.txt"
+          CHANGE_TABLE="$RUNNER_TEMP/avm_change_table.txt"
+          > "$CHANGE_MAP"
+          > "$CHANGE_TABLE"
+          UPDATES_LIST="$RUNNER_TEMP/module_updates.txt"
+          AVM_REPO="Azure/bicep-registry-modules"
+          SEEN_MODULES=$(mktemp)
+
+          if [ ! -s "$UPDATES_LIST" ]; then
+            echo "No module updates to process"
+            echo "change_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Deduplicate modules (same module may appear in multiple files)
+          sort -u "$UPDATES_LIST" > /tmp/unique_updates.txt
+
+          while IFS='|' read -r MODULE_PATH OLD_VER NEW_VER; do
+            [ -z "$MODULE_PATH" ] && continue
+
+            OLD_TAG="${MODULE_PATH}/${OLD_VER}"
+            NEW_TAG="${MODULE_PATH}/${NEW_VER}"
+
+            echo "::group::Change map: ${MODULE_PATH} ${OLD_VER} → ${NEW_VER}"
+
+            # Fetch old main.bicep from GitHub (using git tag as ref)
+            OLD_BICEP=$(curl -sf \
+              "https://api.github.com/repos/${AVM_REPO}/contents/${MODULE_PATH}/main.bicep?ref=${OLD_TAG}" \
+              -H "Accept: application/vnd.github.raw+json" \
+              -H "Authorization: Bearer $GH_TOKEN" 2>/dev/null || echo "")
+
+            if [ -z "$OLD_BICEP" ]; then
+              echo "  Could not fetch old main.bicep for tag ${OLD_TAG}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Fetch new main.bicep
+            NEW_BICEP=$(curl -sf \
+              "https://api.github.com/repos/${AVM_REPO}/contents/${MODULE_PATH}/main.bicep?ref=${NEW_TAG}" \
+              -H "Accept: application/vnd.github.raw+json" \
+              -H "Authorization: Bearer $GH_TOKEN" 2>/dev/null || echo "")
+
+            if [ -z "$NEW_BICEP" ]; then
+              echo "  Could not fetch new main.bicep for tag ${NEW_TAG}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Extract top-level param names (sorted)
+            OLD_PARAMS=$(echo "$OLD_BICEP" | grep -P '^param\s+' | awk '{print $2}' | sort)
+            NEW_PARAMS=$(echo "$NEW_BICEP" | grep -P '^param\s+' | awk '{print $2}' | sort)
+
+            # Diff: removed params (in old, not in new)
+            REMOVED=$(comm -23 <(echo "$OLD_PARAMS") <(echo "$NEW_PARAMS"))
+            # Diff: added params (in new, not in old)
+            ADDED=$(comm -13 <(echo "$OLD_PARAMS") <(echo "$NEW_PARAMS"))
+
+            # Remaining added params (shrinks as we match renames)
+            REMAINING_ADDED="$ADDED"
+
+            if [ -z "$REMOVED" ] && [ -z "$ADDED" ]; then
+              echo "  No parameter changes detected"
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "  Removed params: $(echo $REMOVED | tr '\n' ' ')"
+            echo "  Added params:   $(echo $ADDED | tr '\n' ' ')"
+
+            # Match removed → added to find renames
+            for OLD_P in $REMOVED; do
+              CAP="$(echo "${OLD_P:0:1}" | tr '[:lower:]' '[:upper:]')${OLD_P:1}"
+              MATCH=""
+
+              # Pass 1 — camelCase suffix match (e.g., zone → availabilityZone)
+              for NEW_P in $REMAINING_ADDED; do
+                case "$NEW_P" in *"$CAP") MATCH="$NEW_P"; break ;; esac
+              done
+
+              # Pass 2 — case-insensitive substring
+              if [ -z "$MATCH" ]; then
+                for NEW_P in $REMAINING_ADDED; do
+                  if echo "$NEW_P" | grep -qi "$OLD_P"; then
+                    MATCH="$NEW_P"
+                    break
+                  fi
+                done
+              fi
+
+              if [ -n "$MATCH" ]; then
+                echo "  RENAME: ${OLD_P} → ${MATCH}"
+                echo "RENAME|${MODULE_PATH}|${OLD_P}|${MATCH}" >> "$CHANGE_MAP"
+                echo "| \`${MODULE_PATH}\` | Renamed | \`${OLD_P}\` | \`${MATCH}\` |" >> "$CHANGE_TABLE"
+                REMAINING_ADDED=$(echo "$REMAINING_ADDED" | grep -v "^${MATCH}$" || true)
+              else
+                echo "  REMOVE: ${OLD_P} (no matching new param)"
+                echo "REMOVE|${MODULE_PATH}|${OLD_P}|" >> "$CHANGE_MAP"
+                echo "| \`${MODULE_PATH}\` | Removed | \`${OLD_P}\` | — |" >> "$CHANGE_TABLE"
+              fi
+            done
+
+            # Log newly added params (these may require manual additions)
+            for NEW_P in $REMAINING_ADDED; do
+              echo "  ADD: ${NEW_P} (new required param)"
+              echo "ADD|${MODULE_PATH}||${NEW_P}" >> "$CHANGE_MAP"
+              echo "| \`${MODULE_PATH}\` | Added | — | \`${NEW_P}\` |" >> "$CHANGE_TABLE"
+            done
+
+            echo "::endgroup::"
+          done < /tmp/unique_updates.txt
+
+          CHANGE_COUNT=$(wc -l < "$CHANGE_MAP" 2>/dev/null | tr -d ' ')
+          echo "change_count=${CHANGE_COUNT:-0}" >> "$GITHUB_OUTPUT"
+
+          # Output the change table for PR body
+          {
+            echo 'change_table<<EOF'
+            cat "$CHANGE_TABLE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f /tmp/unique_updates.txt
+
+      # ---------------------------------------------------------------
+      # Auto-fix loop: two-phase approach
+      #
+      # Phase 1 — Source-based fixes (high confidence):
+      #   Use the AVM change map (built from GitHub source) to apply
+      #   known parameter renames and removals directly.
+      #
+      # Phase 2 — BCP error-based fixes (fallback):
+      #   Parse Bicep build errors (BCP037/BCP035) and attempt to
+      #   match removed→missing properties for anything the change
+      #   map didn't cover. Repeat up to MAX_ATTEMPTS times.
       # ---------------------------------------------------------------
       - name: Auto-fix breaking changes
         id: autofix
@@ -113,6 +313,7 @@ jobs:
           BICEP_FILES=$(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort)
           MAX_ATTEMPTS=3
           FIX_LOG="$RUNNER_TEMP/auto_fix_log.txt"
+          CHANGE_MAP="$RUNNER_TEMP/avm_change_map.txt"
           > "$FIX_LOG"
 
           for BICEP_FILE in $BICEP_FILES; do
@@ -139,8 +340,83 @@ jobs:
               echo "${BEST_NAME:-unknown}	${BEST_PATH:-unknown}"
             }
 
+            # ── Phase 1: Apply source-based fixes from AVM change map ──
+            if [ -s "$CHANGE_MAP" ]; then
+              echo "  Phase 1: Applying known changes from AVM source..."
+              PHASE1_FIXED=0
+
+              while IFS=: read -r MOD_LINE MOD_NAME MOD_AVM_PATH; do
+                # Find the params block range for this module
+                TOTAL_LINES=$(wc -l < "$BICEP_FILE")
+                # Scan for 'params:' after the module declaration line
+                PARAMS_START=""
+                for (( i=MOD_LINE; i<=TOTAL_LINES; i++ )); do
+                  if sed -n "${i}p" "$BICEP_FILE" | grep -qP '^\s+params:\s*\{'; then
+                    PARAMS_START=$i
+                    break
+                  fi
+                  # Also match 'params: {' on separate line
+                  if sed -n "${i}p" "$BICEP_FILE" | grep -qP '^\s+params:\s*$'; then
+                    PARAMS_START=$((i + 1))
+                    break
+                  fi
+                  # Stop if we hit the next module or end of block
+                  if [ "$i" -gt "$((MOD_LINE + 2))" ] && sed -n "${i}p" "$BICEP_FILE" | grep -qP '^(module |resource |var |output )'; then
+                    break
+                  fi
+                done
+
+                [ -z "$PARAMS_START" ] && continue
+
+                # Apply renames from change map for this module's AVM path
+                while IFS='|' read -r ACTION MAP_PATH OLD_PARAM NEW_PARAM; do
+                  [ "$MAP_PATH" != "$MOD_AVM_PATH" ] && continue
+
+                  if [ "$ACTION" = "RENAME" ]; then
+                    # Find the line within this module's params block that uses OLD_PARAM
+                    MATCH_LINE=$(awk -v start="$PARAMS_START" -v prop="$OLD_PARAM" '
+                      NR >= start {
+                        depth += gsub(/{/, "{"); depth -= gsub(/}/, "}")
+                        if (depth <= 0 && NR > start) exit
+                        if ($0 ~ "^[[:space:]]+" prop ":") { print NR; exit }
+                      }
+                    ' "$BICEP_FILE")
+
+                    if [ -n "$MATCH_LINE" ]; then
+                      echo "    RENAME (source): '${OLD_PARAM}' → '${NEW_PARAM}' (line $MATCH_LINE) in $MOD_NAME"
+                      sed -i "${MATCH_LINE}s/^\([[:space:]]*\)${OLD_PARAM}:/\1${NEW_PARAM}:/" "$BICEP_FILE"
+                      MOD_RES="$MOD_AVM_PATH"
+                      echo "RENAME|${OLD_PARAM}|${NEW_PARAM}|${MATCH_LINE}|${MOD_NAME}|${MOD_RES}|./${BICEP_FILE}" >> "$FIX_LOG"
+                      PHASE1_FIXED=$((PHASE1_FIXED + 1))
+                    fi
+
+                  elif [ "$ACTION" = "REMOVE" ]; then
+                    MATCH_LINE=$(awk -v start="$PARAMS_START" -v prop="$OLD_PARAM" '
+                      NR >= start {
+                        depth += gsub(/{/, "{"); depth -= gsub(/}/, "}")
+                        if (depth <= 0 && NR > start) exit
+                        if ($0 ~ "^[[:space:]]+" prop ":") { print NR; exit }
+                      }
+                    ' "$BICEP_FILE")
+
+                    if [ -n "$MATCH_LINE" ]; then
+                      echo "    COMMENT OUT (source): '${OLD_PARAM}' (line $MATCH_LINE) in $MOD_NAME"
+                      sed -i "${MATCH_LINE}s|^\([[:space:]]*\)\(.*\)|\1// [auto-removed] \2|" "$BICEP_FILE"
+                      MOD_RES="$MOD_AVM_PATH"
+                      echo "REMOVE|${OLD_PARAM}||${MATCH_LINE}|${MOD_NAME}|${MOD_RES}|./${BICEP_FILE}" >> "$FIX_LOG"
+                      PHASE1_FIXED=$((PHASE1_FIXED + 1))
+                    fi
+                  fi
+                done < "$CHANGE_MAP"
+
+              done < "$MODULE_INDEX"
+
+              echo "  Phase 1 applied $PHASE1_FIXED fix(es) from AVM source"
+            fi
+
+            # ── Phase 2: BCP error-based fallback ──
             for attempt in $(seq 1 $MAX_ATTEMPTS); do
-              echo "::group::Auto-fix ./$BICEP_FILE attempt $attempt/$MAX_ATTEMPTS"
+              echo "::group::Auto-fix ./$BICEP_FILE Phase 2 attempt $attempt/$MAX_ATTEMPTS"
 
               # Build and capture errors
               ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
@@ -365,6 +641,7 @@ jobs:
           AUTO_RESULT="${{ steps.autofix.outputs.auto_fix_result }}"
           FIX_COUNT="${{ steps.autofix.outputs.fix_count }}"
           VALIDATION="${{ steps.validation.outputs.result }}"
+          CHANGE_COUNT="${{ steps.changemap.outputs.change_count }}"
 
           {
             echo 'body<<EOF'
@@ -374,6 +651,18 @@ jobs:
             echo ''
             echo '${{ steps.check.outputs.update_table }}'
             echo ''
+
+            # Parameter changes detected from AVM source
+            if [ "$CHANGE_COUNT" != "0" ] && [ "$CHANGE_COUNT" != "" ]; then
+              echo '### Parameter Changes Detected (from [AVM source](https://github.com/Azure/bicep-registry-modules/tree/main/avm))'
+              echo ''
+              echo 'Cross-referenced old and new module versions to identify parameter interface changes:'
+              echo ''
+              echo '| Module | Change | Old Parameter | New Parameter |'
+              echo '|--------|--------|---------------|---------------|'
+              echo '${{ steps.changemap.outputs.change_table }}'
+              echo ''
+            fi
 
             # Auto-fix summary grouped by file
             if [ "$FIX_COUNT" != "0" ]; then
@@ -483,6 +772,7 @@ jobs:
             const affectedModules = '${{ steps.validation.outputs.affected_modules }}';
             const autoResult = '${{ steps.autofix.outputs.auto_fix_result }}';
             const fixCount = '${{ steps.autofix.outputs.fix_count }}';
+            const changeCount = '${{ steps.changemap.outputs.change_count }}';
 
             const stripPath = (s) => s.replace(/\/home\/runner\/work\/[^/]+\/[^/]+\//g, '');
 
@@ -522,6 +812,22 @@ jobs:
               `| Bicep Build | ${buildIcon} |`,
               `| Bicep Lint | ${lintIcon} |`,
             ];
+
+            // Parameter changes detected from AVM source
+            let changeMap = '';
+            try { changeMap = fs.readFileSync(path.join(runnerTemp, 'avm_change_map.txt'), 'utf8').trim(); } catch {}
+
+            if (changeMap) {
+              const changes = changeMap.split('\n').map(l => l.split('|'));
+              lines.push('', '### Parameter Changes Detected (from [AVM source](https://github.com/Azure/bicep-registry-modules/tree/main/avm))', '');
+              lines.push('| Module | Change | Old Parameter | New Parameter |');
+              lines.push('|--------|--------|---------------|---------------|');
+              for (const [action, mod, oldP, newP] of changes) {
+                const label = action === 'RENAME' ? 'Renamed' : action === 'REMOVE' ? 'Removed' : 'Added';
+                lines.push(`| \`${mod}\` | ${label} | \`${oldP || '—'}\` | \`${newP || '—'}\` |`);
+              }
+              lines.push('');
+            }
 
             // Auto-fix changes grouped by file
             if (renames.length > 0 || removals.length > 0) {

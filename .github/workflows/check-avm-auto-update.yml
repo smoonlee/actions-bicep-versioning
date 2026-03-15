@@ -549,22 +549,22 @@ jobs:
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
         run: |
-          > build_errors.txt
+          > "$RUNNER_TEMP/build_errors.txt"
           for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
-            bicep build "$f" --stdout > /dev/null 2>> build_errors.txt || true
+            bicep build "$f" --stdout > /dev/null 2>> "$RUNNER_TEMP/build_errors.txt" || true
           done
-          [ ! -s build_errors.txt ]
+          [ ! -s "$RUNNER_TEMP/build_errors.txt" ]
 
       - name: Bicep Lint (final)
         id: bicep-lint
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
         run: |
-          > lint_errors.txt
+          > "$RUNNER_TEMP/lint_errors.txt"
           for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
-            bicep lint "$f" 2>> lint_errors.txt || true
+            bicep lint "$f" 2>> "$RUNNER_TEMP/lint_errors.txt" || true
           done
-          [ ! -s lint_errors.txt ]
+          [ ! -s "$RUNNER_TEMP/lint_errors.txt" ]
 
       - name: Capture validation results
         id: validation
@@ -574,13 +574,13 @@ jobs:
           LINT_STATUS="${{ steps.bicep-lint.outcome }}"
 
           BUILD_ERRORS=""
-          if [ -f build_errors.txt ] && [ -s build_errors.txt ]; then
-            BUILD_ERRORS=$(cat build_errors.txt)
+          if [ -f "$RUNNER_TEMP/build_errors.txt" ] && [ -s "$RUNNER_TEMP/build_errors.txt" ]; then
+            BUILD_ERRORS=$(cat "$RUNNER_TEMP/build_errors.txt")
           fi
 
           LINT_ERRORS=""
-          if [ -f lint_errors.txt ] && [ -s lint_errors.txt ]; then
-            LINT_ERRORS=$(cat lint_errors.txt)
+          if [ -f "$RUNNER_TEMP/lint_errors.txt" ] && [ -s "$RUNNER_TEMP/lint_errors.txt" ]; then
+            LINT_ERRORS=$(cat "$RUNNER_TEMP/lint_errors.txt")
           fi
 
           if [ "$BUILD_STATUS" = "success" ] && [ "$LINT_STATUS" = "success" ]; then
@@ -606,9 +606,9 @@ jobs:
 
           # Map error line numbers to module names (across all files)
           AFFECTED_MODULES=""
-          if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
+          if [ -f "$RUNNER_TEMP/build_errors.txt" ] || [ -f "$RUNNER_TEMP/lint_errors.txt" ]; then
             for BICEP_FILE in $(find infra/ -name '*.bicep' -not -name '*.bicepparam'); do
-              FILE_ERRORS=$(grep "$BICEP_FILE" build_errors.txt lint_errors.txt 2>/dev/null || true)
+              FILE_ERRORS=$(grep "$BICEP_FILE" "$RUNNER_TEMP/build_errors.txt" "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true)
               ERROR_LINES=$(echo "$FILE_ERRORS" | grep -ohP '\(\d+,' | grep -oP '\d+' | sort -un)
               MODULE_STARTS=$(grep -n '^module ' "$BICEP_FILE" 2>/dev/null | sed 's/:module \([^ ]*\).*/:\1/')
 
@@ -631,8 +631,7 @@ jobs:
           fi
           echo "affected_modules=$AFFECTED_MODULES" >> "$GITHUB_OUTPUT"
 
-          cp build_errors.txt "$RUNNER_TEMP/build_errors.txt" 2>/dev/null || true
-          cp lint_errors.txt "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true
+
 
       - name: Build PR body
         id: pr-body

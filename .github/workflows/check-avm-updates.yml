@@ -166,13 +166,13 @@ jobs:
         id: bicep-build
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
-        run: bicep build infra/main.bicep --stdout > /dev/null 2> build_errors.txt
+        run: bicep build infra/main.bicep --stdout > /dev/null 2> "$RUNNER_TEMP/build_errors.txt"
 
       - name: Bicep Lint
         id: bicep-lint
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
-        run: bicep lint infra/main.bicep 2> lint_errors.txt
+        run: bicep lint infra/main.bicep 2> "$RUNNER_TEMP/lint_errors.txt"
 
       - name: Capture validation results
         id: validation
@@ -182,13 +182,13 @@ jobs:
           LINT_STATUS="${{ steps.bicep-lint.outcome }}"
 
           BUILD_ERRORS=""
-          if [ -f build_errors.txt ] && [ -s build_errors.txt ]; then
-            BUILD_ERRORS=$(cat build_errors.txt)
+          if [ -f "$RUNNER_TEMP/build_errors.txt" ] && [ -s "$RUNNER_TEMP/build_errors.txt" ]; then
+            BUILD_ERRORS=$(cat "$RUNNER_TEMP/build_errors.txt")
           fi
 
           LINT_ERRORS=""
-          if [ -f lint_errors.txt ] && [ -s lint_errors.txt ]; then
-            LINT_ERRORS=$(cat lint_errors.txt)
+          if [ -f "$RUNNER_TEMP/lint_errors.txt" ] && [ -s "$RUNNER_TEMP/lint_errors.txt" ]; then
+            LINT_ERRORS=$(cat "$RUNNER_TEMP/lint_errors.txt")
           fi
 
           if [ "$BUILD_STATUS" = "success" ] && [ "$LINT_STATUS" = "success" ]; then
@@ -214,8 +214,8 @@ jobs:
 
           # Map error line numbers to module names
           AFFECTED_MODULES=""
-          if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
-            ERROR_LINES=$(grep -ohP '\((\d+),' build_errors.txt lint_errors.txt 2>/dev/null | grep -oP '\d+' | sort -un)
+          if [ -f "$RUNNER_TEMP/build_errors.txt" ] || [ -f "$RUNNER_TEMP/lint_errors.txt" ]; then
+            ERROR_LINES=$(grep -ohP '\(\(\d+\),' "$RUNNER_TEMP/build_errors.txt" "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null | grep -oP '\d+' | sort -un)
             MODULE_STARTS=$(grep -n '^module ' infra/main.bicep | sed 's/:module \([^ ]*\).*/:\1/')
 
             for ERR_LINE in $ERROR_LINES; do
@@ -235,9 +235,7 @@ jobs:
           fi
           echo "affected_modules=$AFFECTED_MODULES" >> "$GITHUB_OUTPUT"
 
-          # Save errors to runner temp so they survive the PR creation checkout reset
-          cp build_errors.txt "$RUNNER_TEMP/build_errors.txt" 2>/dev/null || true
-          cp lint_errors.txt "$RUNNER_TEMP/lint_errors.txt" 2>/dev/null || true
+
 
       - name: Create Pull Request
         id: create-pr

@@ -12,6 +12,8 @@ param location string
 @description('Location Short Code')
 param locationShortCode string
 
+param vnetAddressPrefix string
+param subnet1AddressPrefix string
 
 param tags object = {
   'Customer Name': customerName
@@ -24,6 +26,19 @@ param tags object = {
 
 param resourceGroupName string = 'rg-${customerName}-bicep-example-${locationShortCode}'
 param storageAccountName string = 'st${customerName}bicepexample${locationShortCode}'
+param virtualNetworkName string = 'vnet-${customerName}-bicep-example-${locationShortCode}'
+
+var virtualNetworkSettings object = {
+  addressPrefixes: [
+    vnetAddressPrefix
+  ]
+  subnets: [
+    {
+      name: 'subnet1'
+      addressPrefix: subnet1AddressPrefix
+    }
+  ]
+}
 
 //
 // Azure Verified Modules
@@ -47,4 +62,21 @@ module createStorageAccount 'br/public:avm/res/storage/storage-account:0.30.0' =
     location: location
     tags: tags
   }
+  dependsOn: [
+    createResourceGroup
+  ]
+}
+
+module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.7.0' = {
+  name: 'create-virtual-network'
+  scope: resourceGroup(resourceGroupName)
+  params: {
+    name: virtualNetworkName
+    addressPrefixes: virtualNetworkSettings.addressPrefixes
+    subnets: virtualNetworkSettings.subnets
+    tags: tags
+  }
+  dependsOn: [
+    createResourceGroup
+  ]
 }

@@ -144,22 +144,10 @@ jobs:
             echo "updates_found=true" >> "$GITHUB_OUTPUT"
           fi
 
-          # Build PR body with the update table
+          # Output the update table for downstream steps
           {
             echo 'update_table<<EOF'
             cat "$TABLE_FILE"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo 'pr_body<<EOF'
-            echo 'Automated PR to update Azure Verified Module (AVM) references to the latest versions.'
-            echo ''
-            echo '### Module Updates'
-            echo ''
-            cat "$TABLE_FILE"
-            echo ''
-            echo '> **⚠️ Manual review required.** This PR updates module versions only — no auto-fix is applied. Breaking changes (renamed or removed parameters) may need to be resolved manually before merging.'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -399,6 +387,24 @@ jobs:
         run: |
           CHANGE_COUNT="${{ steps.changemap.outputs.change_count }}"
           VALIDATION="${{ steps.validation.outputs.result }}"
+          BUILD_STATUS="${{ steps.validation.outputs.build_status }}"
+          LINT_STATUS="${{ steps.validation.outputs.lint_status }}"
+          AFFECTED="${{ steps.validation.outputs.affected_modules }}"
+
+          # Strip runner workspace path prefix for cleaner output
+          strip_path() { sed 's|/home/runner/work/[^/]*/[^/]*/||g'; }
+
+          BUILD_ERRORS=""
+          if [ -f "$RUNNER_TEMP/build_errors.txt" ] && [ -s "$RUNNER_TEMP/build_errors.txt" ]; then
+            BUILD_ERRORS=$(cat "$RUNNER_TEMP/build_errors.txt" | strip_path)
+          fi
+          LINT_ERRORS=""
+          if [ -f "$RUNNER_TEMP/lint_errors.txt" ] && [ -s "$RUNNER_TEMP/lint_errors.txt" ]; then
+            LINT_ERRORS=$(cat "$RUNNER_TEMP/lint_errors.txt" | strip_path)
+          fi
+
+          BUILD_ICON=$( [ "$BUILD_STATUS" = "success" ] && echo "Passed" || echo "Failed" )
+          LINT_ICON=$( [ "$LINT_STATUS" = "success" ] && echo "Passed" || echo "Failed" )
 
           {
             echo 'body<<EOF'
@@ -409,7 +415,8 @@ jobs:
             echo '${{ steps.check.outputs.update_table }}'
             echo ''
 
-            if [ "$CHANGE_COUNT" != "0" ] && [ "$CHANGE_COUNT" != "" ]; then
+            # Parameter changes detected from AVM source
+            if [ "$CHANGE_COUNT" != "0" ] && [ -n "$CHANGE_COUNT" ]; then
               echo '### Parameter Changes Detected (from [AVM source](https://github.com/Azure/bicep-registry-modules/tree/main/avm))'
               echo ''
               echo 'Cross-referenced old and new module versions to identify parameter interface changes:'
@@ -417,6 +424,42 @@ jobs:
               echo '| Module | Change | Old Parameter | New Parameter |'
               echo '|--------|--------|---------------|---------------|'
               echo '${{ steps.changemap.outputs.change_table }}'
+              echo ''
+            fi
+
+            echo '### Validation Results'
+            echo ''
+            echo '| Check | Status |'
+            echo '|-------|--------|'
+            echo "| Bicep Build | ${BUILD_ICON} |"
+            echo "| Bicep Lint  | ${LINT_ICON} |"
+            echo ''
+
+            if [ -n "$AFFECTED" ] && [ "$VALIDATION" != "success" ]; then
+              echo '### Affected Modules'
+              echo ''
+              IFS=',' read -ra MODS <<< "$AFFECTED"
+              for m in "${MODS[@]}"; do
+                echo "- \`${m}\`"
+              done
+              echo ''
+            fi
+
+            if [ -n "$BUILD_ERRORS" ]; then
+              echo '### Build Errors'
+              echo ''
+              echo '```'
+              echo "$BUILD_ERRORS"
+              echo '```'
+              echo ''
+            fi
+
+            if [ -n "$LINT_ERRORS" ]; then
+              echo '### Lint Warnings / Errors'
+              echo ''
+              echo '```'
+              echo "$LINT_ERRORS"
+              echo '```'
               echo ''
             fi
 

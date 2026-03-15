@@ -106,6 +106,27 @@ jobs:
           FIX_LOG="$RUNNER_TEMP/auto_fix_log.txt"
           > "$FIX_LOG"
 
+          # Build module lookup: line_number:module_name:avm_path
+          MODULE_INDEX=$(mktemp)
+          grep -n '^module ' "$BICEP_FILE" | while IFS= read -r modline; do
+            MOD_LINENUM=$(echo "$modline" | cut -d: -f1)
+            MOD_NAME=$(echo "$modline" | sed "s/^[0-9]*:module \([^ ]*\).*/\1/")
+            AVM_PATH=$(sed -n "${MOD_LINENUM}p" "$BICEP_FILE" | grep -oP "avm/[^:'\"]+" || echo "unknown")
+            echo "${MOD_LINENUM}:${MOD_NAME}:${AVM_PATH}" >> "$MODULE_INDEX"
+          done
+
+          # Function: resolve error line to module_name and avm_path (tab-separated)
+          resolve_module() {
+            local ERR_LINE=$1
+            local BEST_NAME="" BEST_PATH="" BEST_START=0
+            while IFS=: read -r ML MN MP; do
+              if [ "$ERR_LINE" -ge "$ML" ] && [ "$ML" -ge "$BEST_START" ]; then
+                BEST_NAME="$MN"; BEST_PATH="$MP"; BEST_START=$ML
+              fi
+            done < "$MODULE_INDEX"
+            echo "${BEST_NAME:-unknown}	${BEST_PATH:-unknown}"
+          }
+
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
             echo "::group::Auto-fix attempt $attempt/$MAX_ATTEMPTS"
 
@@ -167,17 +188,23 @@ jobs:
               fi
 
               if [ -n "$MATCH" ]; then
-                echo "    RENAME: '$OLD_PROP' → '$MATCH' (line $LINENUM)"
+                MOD_INFO=$(resolve_module "$LINENUM")
+                MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
+                MOD_RES=$(echo "$MOD_INFO" | cut -f2)
+                echo "    RENAME: '$OLD_PROP' → '$MATCH' (line $LINENUM) in $MOD_NAME ($MOD_RES)"
                 sed -i "${LINENUM}s/^\([[:space:]]*\)${OLD_PROP}:/\1${MATCH}:/" "$BICEP_FILE"
-                echo "RENAME|${OLD_PROP}|${MATCH}|${LINENUM}" >> "$FIX_LOG"
+                echo "RENAME|${OLD_PROP}|${MATCH}|${LINENUM}|${MOD_NAME}|${MOD_RES}" >> "$FIX_LOG"
                 # Remove matched property from the missing list
                 grep -v "^${MATCH}$" /tmp/missing.txt > /tmp/missing_new.txt 2>/dev/null || true
                 mv /tmp/missing_new.txt /tmp/missing.txt
                 FIXED=$((FIXED + 1))
               else
-                echo "    COMMENT OUT: '$OLD_PROP' (line $LINENUM) — no replacement found"
+                MOD_INFO=$(resolve_module "$LINENUM")
+                MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
+                MOD_RES=$(echo "$MOD_INFO" | cut -f2)
+                echo "    COMMENT OUT: '$OLD_PROP' (line $LINENUM) in $MOD_NAME ($MOD_RES) — no replacement found"
                 sed -i "${LINENUM}s|^\([[:space:]]*\)\(.*\)|\1// [auto-removed] \2|" "$BICEP_FILE"
-                echo "REMOVE|${OLD_PROP}||${LINENUM}" >> "$FIX_LOG"
+                echo "REMOVE|${OLD_PROP}||${LINENUM}|${MOD_NAME}|${MOD_RES}" >> "$FIX_LOG"
                 FIXED=$((FIXED + 1))
               fi
             done < /tmp/removed.txt
@@ -219,7 +246,7 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-          rm -f /tmp/bcp037.txt /tmp/bcp035.txt /tmp/removed.txt /tmp/missing.txt
+          rm -f /tmp/bcp037.txt /tmp/bcp035.txt /tmp/removed.txt /tmp/missing.txt "$MODULE_INDEX"
 
       # --- Final validation after auto-fix ---
       - name: Bicep Build (final)
@@ -321,12 +348,12 @@ jobs:
               echo ''
               echo 'The following breaking changes were automatically resolved:'
               echo ''
-              echo '| Action | Old Property | New Property | Line |'
-              echo '|--------|-------------|--------------|------|'
-              while IFS='|' read -r ACTION OLD NEW LINE; do
+              echo '| Action | Module Name | Module Resource | Old Property | New Property | Line |'
+              echo '|--------|-------------|-----------------|-------------|--------------|------|'
+              while IFS='|' read -r ACTION OLD NEW LINE MOD_NAME MOD_RES; do
                 case "$ACTION" in
-                  RENAME)  echo "| Renamed | \`${OLD}\` | \`${NEW}\` | ${LINE} |" ;;
-                  REMOVE)  echo "| Commented out | \`${OLD}\` | — | ${LINE} |" ;;
+                  RENAME)  echo "| Renamed | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | \`${NEW}\` | ${LINE} |" ;;
+                  REMOVE)  echo "| Commented out | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | — | ${LINE} |" ;;
                 esac
               done <<< '${{ steps.autofix.outputs.fix_log }}'
               echo ''
@@ -428,8 +455,8 @@ jobs:
             if (fixLog) {
               for (const line of fixLog.split('\n')) {
                 const parts = line.split('|');
-                if (parts[0] === 'RENAME')     renames.push({ old: parts[1], new: parts[2], line: parts[3] });
-                if (parts[0] === 'REMOVE')     removals.push({ old: parts[1], line: parts[3] });
+                if (parts[0] === 'RENAME')     renames.push({ old: parts[1], new: parts[2], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '' });
+                if (parts[0] === 'REMOVE')     removals.push({ old: parts[1], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '' });
                 if (parts[0] === 'UNRESOLVED') unresolved.push({ prop: parts[1] });
               }
             }
@@ -453,13 +480,13 @@ jobs:
             // Auto-fix changes
             if (renames.length > 0 || removals.length > 0) {
               lines.push('', '### Auto-Fix Changes', '');
-              lines.push('| Action | Old Property | New Property | Line |');
-              lines.push('|--------|-------------|--------------|------|');
+              lines.push('| Action | Module Name | Module Resource | Old Property | New Property | Line |');
+              lines.push('|--------|-------------|-----------------|-------------|--------------|------|');
               for (const r of renames) {
-                lines.push(`| Renamed | \`${r.old}\` | \`${r.new}\` | ${r.line} |`);
+                lines.push(`| Renamed | \`${r.modName}\` | \`${r.modRes}\` | \`${r.old}\` | \`${r.new}\` | ${r.line} |`);
               }
               for (const r of removals) {
-                lines.push(`| Commented out | \`${r.old}\` | — | ${r.line} |`);
+                lines.push(`| Commented out | \`${r.modName}\` | \`${r.modRes}\` | \`${r.old}\` | — | ${r.line} |`);
               }
             }
 

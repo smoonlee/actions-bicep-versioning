@@ -29,7 +29,7 @@ param resourceGroupName string = 'rg-${customerName}-bicep-example-${locationSho
 // Azure Verified Modules
 // No Hard Coded Values, all parameters are passed in from the main.bicepparam file
 
-module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.0' = {
+module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.3' = {
   name: 'create-resource-group'
   params: {
     name: resourceGroupName

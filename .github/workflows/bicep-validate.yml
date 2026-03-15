@@ -30,12 +30,22 @@ jobs:
       - name: Bicep Build
         id: bicep-build
         continue-on-error: true
-        run: bicep build infra/main.bicep --stdout > /dev/null 2> build_errors.txt
+        run: |
+          > build_errors.txt
+          for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
+            bicep build "$f" --stdout > /dev/null 2>> build_errors.txt || true
+          done
+          [ ! -s build_errors.txt ]
 
       - name: Bicep Lint
         id: bicep-lint
         continue-on-error: true
-        run: bicep lint infra/main.bicep 2> lint_errors.txt
+        run: |
+          > lint_errors.txt
+          for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
+            bicep lint "$f" 2>> lint_errors.txt || true
+          done
+          [ ! -s lint_errors.txt ]
 
       - name: Capture validation results
         id: validation
@@ -74,24 +84,28 @@ jobs:
           echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
           echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
 
-          # Map error line numbers to module names
+          # Map error line numbers to module names (across all files)
           AFFECTED_MODULES=""
           if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
-            ERROR_LINES=$(grep -ohP '\((\d+),' build_errors.txt lint_errors.txt 2>/dev/null | grep -oP '\d+' | sort -un)
-            MODULE_STARTS=$(grep -n '^module ' infra/main.bicep | sed 's/:module \([^ ]*\).*/:\1/')
+            for BICEP_FILE in $(find infra/ -name '*.bicep' -not -name '*.bicepparam'); do
+              FILE_ERRORS=$(grep "$BICEP_FILE" build_errors.txt lint_errors.txt 2>/dev/null || true)
+              ERROR_LINES=$(echo "$FILE_ERRORS" | grep -ohP '\(\d+,' | grep -oP '\d+' | sort -un)
+              MODULE_STARTS=$(grep -n '^module ' "$BICEP_FILE" 2>/dev/null | sed 's/:module \([^ ]*\).*/:\1/')
 
-            for ERR_LINE in $ERROR_LINES; do
-              MATCHED_MODULE=""
-              MATCHED_START=0
-              while IFS=: read -r MOD_LINE MOD_NAME; do
-                if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
-                  MATCHED_MODULE="$MOD_NAME"
-                  MATCHED_START=$MOD_LINE
-                fi
+              for ERR_LINE in $ERROR_LINES; do
+                [ -z "$ERR_LINE" ] && continue
+                MATCHED_MODULE=""
+                MATCHED_START=0
+                while IFS=: read -r MOD_LINE MOD_NAME; do
+                  if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
+                    MATCHED_MODULE="$MOD_NAME"
+                    MATCHED_START=$MOD_LINE
+                  fi
               done <<< "$MODULE_STARTS"
               if [ -n "$MATCHED_MODULE" ]; then
                 AFFECTED_MODULES="$AFFECTED_MODULES $MATCHED_MODULE"
               fi
+            done
             done
             AFFECTED_MODULES=$(echo "$AFFECTED_MODULES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
           fi

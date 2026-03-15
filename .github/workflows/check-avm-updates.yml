@@ -1,0 +1,89 @@
+name: "Check AVM Module Updates"
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Every Monday at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-updates:
+    name: "Check for AVM Updates"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for AVM module updates
+        id: check
+        run: |
+          set -e
+          UPDATES_FOUND=false
+
+          # Find all Bicep files with AVM module references
+          grep -rn "br/public:avm/" infra/ --include="*.bicep" | while IFS=: read -r file line content; do
+            # Extract module path and current version
+            MODULE_REF=$(echo "$content" | grep -oP "br/public:avm/[^'\"]+")
+            if [ -z "$MODULE_REF" ]; then
+              continue
+            fi
+
+            # Split into module path and version
+            MODULE_PATH=$(echo "$MODULE_REF" | rev | cut -d: -f2- | rev | sed 's|br/public:||')
+            CURRENT_VERSION=$(echo "$MODULE_REF" | rev | cut -d: -f1 | rev)
+
+            # Query MCR for available tags
+            REGISTRY_PATH="bicep/${MODULE_PATH}"
+            echo "Checking ${REGISTRY_PATH} (current: ${CURRENT_VERSION})"
+
+            TAGS_JSON=$(curl -sf "https://mcr.microsoft.com/v2/${REGISTRY_PATH}/tags/list" 2>/dev/null || echo "")
+            if [ -z "$TAGS_JSON" ]; then
+              echo "  WARNING: Could not fetch tags for ${REGISTRY_PATH}"
+              continue
+            fi
+
+            # Get the latest semver tag (sort by version)
+            LATEST_VERSION=$(echo "$TAGS_JSON" | jq -r '.tags[]' | sort -V | tail -n 1)
+
+            if [ -z "$LATEST_VERSION" ]; then
+              echo "  WARNING: No tags found for ${REGISTRY_PATH}"
+              continue
+            fi
+
+            echo "  Latest: ${LATEST_VERSION}"
+
+            if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+              echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+              # Replace the version in the file
+              sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+              UPDATES_FOUND=true
+            else
+              echo "  Up to date"
+            fi
+          done
+
+          # Detect changes via git
+          if git diff --quiet; then
+            echo "updates_found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updates_found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Pull Request
+        if: steps.check.outputs.updates_found == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: update AVM Bicep module versions"
+          branch: "chore/avm-module-updates"
+          title: "chore: Update AVM Bicep module versions"
+          body: |
+            Automated PR to update Azure Verified Module (AVM) references to the latest versions.
+
+            Please review the version changes and ensure compatibility before merging.
+          labels: |
+            dependencies
+            bicep
+          delete-branch: true

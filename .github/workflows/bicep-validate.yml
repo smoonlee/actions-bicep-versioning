@@ -1,0 +1,33 @@
+name: "Bicep Validate"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: "Bicep Build & Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: |
+          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+
+      - name: Bicep Build
+        run: bicep build infra/main.bicep --stdout > /dev/null
+
+      - name: Bicep Lint
+        run: bicep lint infra/main.bicep

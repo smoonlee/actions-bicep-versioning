@@ -21,10 +21,17 @@ jobs:
         id: check
         run: |
           set -e
+          TABLE_FILE=$(mktemp)
+          echo "| Module | Current Version | Latest Version |" >> "$TABLE_FILE"
+          echo "|--------|-----------------|----------------|" >> "$TABLE_FILE"
+
           UPDATES_FOUND=false
 
           # Find all Bicep files with AVM module references
-          grep -rn "br/public:avm/" infra/ --include="*.bicep" | while IFS=: read -r file line content; do
+          while IFS= read -r match; do
+            file=$(echo "$match" | cut -d: -f1)
+            content=$(echo "$match" | cut -d: -f3-)
+
             # Extract module path and current version
             MODULE_REF=$(echo "$content" | grep -oP "br/public:avm/[^'\"]+")
             if [ -z "$MODULE_REF" ]; then
@@ -57,13 +64,11 @@ jobs:
 
             if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
               echo "  UPDATE AVAILABLE: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
-              # Replace the version in the file
               sed -i "s|${MODULE_REF}|br/public:${MODULE_PATH}:${LATEST_VERSION}|g" "$file"
+              echo "| \`${MODULE_PATH}\` | \`${CURRENT_VERSION}\` | \`${LATEST_VERSION}\` |" >> "$TABLE_FILE"
               UPDATES_FOUND=true
-            else
-              echo "  Up to date"
             fi
-          done
+          done < <(grep -rn "br/public:avm/" infra/ --include="*.bicep")
 
           # Detect changes via git
           if git diff --quiet; then
@@ -71,6 +76,21 @@ jobs:
           else
             echo "updates_found=true" >> "$GITHUB_OUTPUT"
           fi
+
+          # Build PR body with the update table
+          {
+            echo 'pr_body<<EOF'
+            echo 'Automated PR to update Azure Verified Module (AVM) references to the latest versions.'
+            echo ''
+            echo '### Module Updates'
+            echo ''
+            cat "$TABLE_FILE"
+            echo ''
+            echo 'Please review the version changes and ensure compatibility before merging.'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f "$TABLE_FILE"
 
       - name: Create Pull Request
         if: steps.check.outputs.updates_found == 'true'
@@ -80,10 +100,7 @@ jobs:
           commit-message: "chore: update AVM Bicep module versions"
           branch: "chore/avm-module-updates"
           title: "chore: Update AVM Bicep module versions"
-          body: |
-            Automated PR to update Azure Verified Module (AVM) references to the latest versions.
-
-            Please review the version changes and ensure compatibility before merging.
+          body: ${{ steps.check.outputs.pr_body }}
           labels: |
             dependencies
             bicep

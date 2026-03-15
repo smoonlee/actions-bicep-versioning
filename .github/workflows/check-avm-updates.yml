@@ -92,11 +92,26 @@ jobs:
 
           rm -f "$TABLE_FILE"
 
+      - name: Install Bicep CLI
+        if: steps.check.outputs.updates_found == 'true'
+        run: |
+          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+
+      - name: Bicep Build
+        if: steps.check.outputs.updates_found == 'true'
+        run: bicep build infra/main.bicep --stdout > /dev/null
+
+      - name: Bicep Lint
+        if: steps.check.outputs.updates_found == 'true'
+        run: bicep lint infra/main.bicep
+
       - name: Create Pull Request
         if: steps.check.outputs.updates_found == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.PAT_TOKEN }}
           commit-message: "chore: update AVM Bicep module versions"
           branch: "chore/avm-module-updates"
           title: "chore: Update AVM Bicep module versions"

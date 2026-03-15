@@ -29,7 +29,7 @@ param storageAccountName string = 'st${customerName}bicepexample${locationShortC
 // Azure Verified Modules
 // No Hard Coded Values, all parameters are passed in from the main.bicepparam file
 
-module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.0' = {
+module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.3' = {
   name: 'create-resource-group'
   params: {
     name: resourceGroupName
@@ -38,7 +38,7 @@ module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.0' = 
   }
 }
 
-module createStorageAccount 'br/public:avm/res/storage/storage-account:0.30.0' = {
+module createStorageAccount 'br/public:avm/res/storage/storage-account:0.32.0' = {
   name: 'create-storage-account'
   scope: resourceGroup(resourceGroupName)
   params: {

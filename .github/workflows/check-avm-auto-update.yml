@@ -246,8 +246,8 @@ jobs:
             echo "auto_fix_result=partial" >> "$GITHUB_OUTPUT"
           fi
 
-          FIX_COUNT=$(grep -c '^RENAME\|^REMOVE' "$FIX_LOG" 2>/dev/null || echo "0")
-          echo "fix_count=$FIX_COUNT" >> "$GITHUB_OUTPUT"
+          FIX_COUNT=$(grep -c '^RENAME\|^REMOVE' "$FIX_LOG" 2>/dev/null || true)
+          echo "fix_count=${FIX_COUNT:-0}" >> "$GITHUB_OUTPUT"
 
           {
             echo 'fix_log<<EOF'

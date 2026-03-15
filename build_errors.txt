@@ -1,0 +1,1 @@
+/home/runner/work/actions-bicep-versioning/actions-bicep-versioning/infra/main.bicep(139,5) : Warning no-unnecessary-dependson: Remove unnecessary dependsOn entry 'createVirtualNetwork'. [https://aka.ms/bicep/linter-diagnostics#no-unnecessary-dependson]

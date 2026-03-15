@@ -28,16 +28,92 @@ jobs:
           bicep --version
 
       - name: Bicep Build
-        run: bicep build infra/main.bicep --stdout > /dev/null
+        id: bicep-build
+        continue-on-error: true
+        run: bicep build infra/main.bicep --stdout > /dev/null 2> build_errors.txt
 
       - name: Bicep Lint
-        run: bicep lint infra/main.bicep
+        id: bicep-lint
+        continue-on-error: true
+        run: bicep lint infra/main.bicep 2> lint_errors.txt
+
+      - name: Capture validation results
+        id: validation
+        run: |
+          BUILD_STATUS="${{ steps.bicep-build.outcome }}"
+          LINT_STATUS="${{ steps.bicep-lint.outcome }}"
+
+          BUILD_ERRORS=""
+          if [ -f build_errors.txt ] && [ -s build_errors.txt ]; then
+            BUILD_ERRORS=$(cat build_errors.txt)
+          fi
+
+          LINT_ERRORS=""
+          if [ -f lint_errors.txt ] && [ -s lint_errors.txt ]; then
+            LINT_ERRORS=$(cat lint_errors.txt)
+          fi
+
+          if [ "$BUILD_STATUS" = "success" ] && [ "$LINT_STATUS" = "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo 'build_errors<<EOF'
+            echo "$BUILD_ERRORS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'lint_errors<<EOF'
+            echo "$LINT_ERRORS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
+          echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Post validation comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v8
         with:
           script: |
+            const result = '${{ steps.validation.outputs.result }}';
+            const buildStatus = '${{ steps.validation.outputs.build_status }}';
+            const lintStatus = '${{ steps.validation.outputs.lint_status }}';
+            const buildErrors = `${{ steps.validation.outputs.build_errors }}`.trim();
+            const lintErrors = `${{ steps.validation.outputs.lint_errors }}`.trim();
+
+            const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
+            const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';
+            const heading = result === 'success'
+              ? '## Bicep Validation Passed'
+              : '## Bicep Validation Failed — Manual Intervention Required';
+
+            const lines = [
+              '<!-- bicep-validate-comment -->',
+              heading,
+              '',
+              '| Check | Status |',
+              '|-------|--------|',
+              `| Bicep Build | ${buildIcon} |`,
+              `| Bicep Lint | ${lintIcon} |`,
+            ];
+
+            if (buildErrors) {
+              lines.push('', '### Build Errors', '', '```', buildErrors, '```');
+            }
+            if (lintErrors) {
+              lines.push('', '### Lint Warnings / Errors', '', '```', lintErrors, '```');
+            }
+            if (result !== 'success') {
+              lines.push('', '> **Note:** The Bicep files have errors that need to be resolved before this PR can be merged.');
+            }
+
+            lines.push('', `Validated at \`${new Date().toISOString()}\` by [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`);
+
+            const body = lines.join('\n');
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -45,17 +121,6 @@ jobs:
             });
             const marker = '<!-- bicep-validate-comment -->';
             const existing = comments.find(c => c.body.includes(marker));
-            const body = [
-              marker,
-              '## Bicep Validation Passed',
-              '',
-              '| Check | Status |',
-              '|-------|--------|',
-              '| Bicep Build | Passed |',
-              '| Bicep Lint | Passed |',
-              '',
-              `Validated at \`${new Date().toISOString()}\` by [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`
-            ].join('\n');
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -71,3 +136,7 @@ jobs:
                 body
               });
             }
+
+      - name: Fail workflow if validation failed
+        if: steps.validation.outputs.result == 'failure'
+        run: exit 1

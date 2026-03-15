@@ -110,137 +110,147 @@ jobs:
         if: steps.check.outputs.updates_found == 'true'
         shell: bash
         run: |
-          BICEP_FILE="infra/main.bicep"
+          BICEP_FILES=$(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort)
           MAX_ATTEMPTS=3
           FIX_LOG="$RUNNER_TEMP/auto_fix_log.txt"
           > "$FIX_LOG"
 
-          # Build module lookup: line_number:module_name:avm_path
-          MODULE_INDEX=$(mktemp)
-          grep -n '^module ' "$BICEP_FILE" | while IFS= read -r modline; do
-            MOD_LINENUM=$(echo "$modline" | cut -d: -f1)
-            MOD_NAME=$(echo "$modline" | sed "s/^[0-9]*:module \([^ ]*\).*/\1/")
-            AVM_PATH=$(sed -n "${MOD_LINENUM}p" "$BICEP_FILE" | grep -oP "avm/[^:'\"]+" || echo "unknown")
-            echo "${MOD_LINENUM}:${MOD_NAME}:${AVM_PATH}" >> "$MODULE_INDEX"
-          done
+          for BICEP_FILE in $BICEP_FILES; do
+            echo "=== Processing ./$BICEP_FILE ==="
 
-          # Function: resolve error line to module_name and avm_path (tab-separated)
-          resolve_module() {
-            local ERR_LINE=$1
-            local BEST_NAME="" BEST_PATH="" BEST_START=0
-            while IFS=: read -r ML MN MP; do
-              if [ "$ERR_LINE" -ge "$ML" ] && [ "$ML" -ge "$BEST_START" ]; then
-                BEST_NAME="$MN"; BEST_PATH="$MP"; BEST_START=$ML
+            # Build module lookup: line_number:module_name:avm_path
+            MODULE_INDEX=$(mktemp)
+            while IFS= read -r modline; do
+              MOD_LINENUM=$(echo "$modline" | cut -d: -f1)
+              MOD_NAME=$(echo "$modline" | sed "s/^[0-9]*:module \([^ ]*\).*/\1/")
+              AVM_PATH=$(sed -n "${MOD_LINENUM}p" "$BICEP_FILE" | grep -oP "avm/[^:'\"]+" || echo "unknown")
+              echo "${MOD_LINENUM}:${MOD_NAME}:${AVM_PATH}" >> "$MODULE_INDEX"
+            done < <(grep -n '^module ' "$BICEP_FILE" || true)
+
+            # Function: resolve error line to module_name and avm_path (tab-separated)
+            resolve_module() {
+              local ERR_LINE=$1
+              local BEST_NAME="" BEST_PATH="" BEST_START=0
+              while IFS=: read -r ML MN MP; do
+                if [ "$ERR_LINE" -ge "$ML" ] && [ "$ML" -ge "$BEST_START" ]; then
+                  BEST_NAME="$MN"; BEST_PATH="$MP"; BEST_START=$ML
+                fi
+              done < "$MODULE_INDEX"
+              echo "${BEST_NAME:-unknown}	${BEST_PATH:-unknown}"
+            }
+
+            for attempt in $(seq 1 $MAX_ATTEMPTS); do
+              echo "::group::Auto-fix ./$BICEP_FILE attempt $attempt/$MAX_ATTEMPTS"
+
+              # Build and capture errors
+              ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
+
+              ERROR_COUNT=$(echo "$ERRORS" | grep -c ' : Error ' || true)
+              if [ "$ERROR_COUNT" -eq 0 ]; then
+                echo "No build errors — build is clean"
+                echo "::endgroup::"
+                break
               fi
-            done < "$MODULE_INDEX"
-            echo "${BEST_NAME:-unknown}	${BEST_PATH:-unknown}"
-          }
+              echo "Found $ERROR_COUNT error(s)"
 
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            echo "::group::Auto-fix attempt $attempt/$MAX_ATTEMPTS"
+              # --- Parse BCP037: removed / not-allowed properties ---
+              echo "$ERRORS" | grep 'BCP037' > /tmp/bcp037.txt 2>/dev/null || true
+              > /tmp/removed.txt
+              while IFS= read -r errline; do
+                [ -z "$errline" ] && continue
+                LINENUM=$(echo "$errline" | grep -oP '\(\d+,' | head -1 | grep -oP '\d+')
+                PROP=$(echo "$errline" | grep -oP 'The property "\K[^"]+')
+                [ -n "$LINENUM" ] && [ -n "$PROP" ] && echo "${LINENUM}:${PROP}" >> /tmp/removed.txt
+              done < /tmp/bcp037.txt
 
-            # Build and capture errors
-            ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
+              # --- Parse BCP035: missing required properties ---
+              echo "$ERRORS" | grep 'BCP035' > /tmp/bcp035.txt 2>/dev/null || true
+              > /tmp/missing.txt
+              while IFS= read -r errline; do
+                [ -z "$errline" ] && continue
+                echo "$errline" | sed 's/.*required properties: //' | grep -oP '"[^"]+"' | tr -d '"'
+              done < /tmp/bcp035.txt | sort -u > /tmp/missing.txt
 
-            ERROR_COUNT=$(echo "$ERRORS" | grep -c ' : Error ' || true)
-            if [ "$ERROR_COUNT" -eq 0 ]; then
-              echo "No build errors — build is clean"
-              echo "::endgroup::"
-              break
-            fi
-            echo "Found $ERROR_COUNT error(s)"
+              echo "  Removed properties (BCP037):" && cat /tmp/removed.txt 2>/dev/null || true
+              echo "  Missing properties (BCP035):" && cat /tmp/missing.txt 2>/dev/null || true
 
-            # --- Parse BCP037: removed / not-allowed properties ---
-            echo "$ERRORS" | grep 'BCP037' > /tmp/bcp037.txt 2>/dev/null || true
-            > /tmp/removed.txt
-            while IFS= read -r errline; do
-              [ -z "$errline" ] && continue
-              LINENUM=$(echo "$errline" | grep -oP '\(\d+,' | head -1 | grep -oP '\d+')
-              PROP=$(echo "$errline" | grep -oP 'The property "\K[^"]+')
-              [ -n "$LINENUM" ] && [ -n "$PROP" ] && echo "${LINENUM}:${PROP}" >> /tmp/removed.txt
-            done < /tmp/bcp037.txt
+              FIXED=0
 
-            # --- Parse BCP035: missing required properties ---
-            echo "$ERRORS" | grep 'BCP035' > /tmp/bcp035.txt 2>/dev/null || true
-            > /tmp/missing.txt
-            while IFS= read -r errline; do
-              [ -z "$errline" ] && continue
-              echo "$errline" | sed 's/.*required properties: //' | grep -oP '"[^"]+"' | tr -d '"'
-            done < /tmp/bcp035.txt | sort -u > /tmp/missing.txt
+              # --- Match removed properties to missing ones ---
+              while IFS=: read -r LINENUM OLD_PROP; do
+                [ -z "$OLD_PROP" ] && continue
+                CAPITALISED="$(echo "${OLD_PROP:0:1}" | tr '[:lower:]' '[:upper:]')${OLD_PROP:1}"
+                MATCH=""
 
-            echo "  Removed properties (BCP037):" && cat /tmp/removed.txt 2>/dev/null || true
-            echo "  Missing properties (BCP035):" && cat /tmp/missing.txt 2>/dev/null || true
-
-            FIXED=0
-
-            # --- Match removed properties to missing ones ---
-            while IFS=: read -r LINENUM OLD_PROP; do
-              [ -z "$OLD_PROP" ] && continue
-              CAPITALISED="$(echo "${OLD_PROP:0:1}" | tr '[:lower:]' '[:upper:]')${OLD_PROP:1}"
-              MATCH=""
-
-              # Pass 1 — camelCase suffix (most precise, e.g. zone → availabilityZone)
-              while IFS= read -r MISS; do
-                [ -z "$MISS" ] && continue
-                case "$MISS" in *"$CAPITALISED") MATCH="$MISS"; break ;; esac
-              done < /tmp/missing.txt
-
-              # Pass 2 — case-insensitive substring
-              if [ -z "$MATCH" ]; then
+                # Pass 1 — camelCase suffix (most precise, e.g. zone → availabilityZone)
                 while IFS= read -r MISS; do
                   [ -z "$MISS" ] && continue
-                  if echo "$MISS" | grep -qi "$OLD_PROP"; then
-                    MATCH="$MISS"
-                    break
-                  fi
+                  case "$MISS" in *"$CAPITALISED") MATCH="$MISS"; break ;; esac
                 done < /tmp/missing.txt
+
+                # Pass 2 — case-insensitive substring
+                if [ -z "$MATCH" ]; then
+                  while IFS= read -r MISS; do
+                    [ -z "$MISS" ] && continue
+                    if echo "$MISS" | grep -qi "$OLD_PROP"; then
+                      MATCH="$MISS"
+                      break
+                    fi
+                  done < /tmp/missing.txt
+                fi
+
+                if [ -n "$MATCH" ]; then
+                  MOD_INFO=$(resolve_module "$LINENUM")
+                  MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
+                  MOD_RES=$(echo "$MOD_INFO" | cut -f2)
+                  echo "    RENAME: '$OLD_PROP' → '$MATCH' (line $LINENUM) in $MOD_NAME ($MOD_RES)"
+                  sed -i "${LINENUM}s/^\([[:space:]]*\)${OLD_PROP}:/\1${MATCH}:/" "$BICEP_FILE"
+                  echo "RENAME|${OLD_PROP}|${MATCH}|${LINENUM}|${MOD_NAME}|${MOD_RES}|./${BICEP_FILE}" >> "$FIX_LOG"
+                  # Remove matched property from the missing list
+                  grep -v "^${MATCH}$" /tmp/missing.txt > /tmp/missing_new.txt 2>/dev/null || true
+                  mv /tmp/missing_new.txt /tmp/missing.txt
+                  FIXED=$((FIXED + 1))
+                else
+                  MOD_INFO=$(resolve_module "$LINENUM")
+                  MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
+                  MOD_RES=$(echo "$MOD_INFO" | cut -f2)
+                  echo "    COMMENT OUT: '$OLD_PROP' (line $LINENUM) in $MOD_NAME ($MOD_RES) — no replacement found"
+                  sed -i "${LINENUM}s|^\([[:space:]]*\)\(.*\)|\1// [auto-removed] \2|" "$BICEP_FILE"
+                  echo "REMOVE|${OLD_PROP}||${LINENUM}|${MOD_NAME}|${MOD_RES}|./${BICEP_FILE}" >> "$FIX_LOG"
+                  FIXED=$((FIXED + 1))
+                fi
+              done < /tmp/removed.txt
+
+              # Log any remaining unresolved missing properties
+              while IFS= read -r MISS; do
+                [ -z "$MISS" ] && continue
+                if ! grep -q "UNRESOLVED|${MISS}|" "$FIX_LOG" 2>/dev/null; then
+                  echo "    UNRESOLVED: missing required property '$MISS'"
+                  echo "UNRESOLVED|${MISS}|||||./${BICEP_FILE}" >> "$FIX_LOG"
+                fi
+              done < /tmp/missing.txt
+
+              echo "::endgroup::"
+
+              if [ "$FIXED" -eq 0 ]; then
+                echo "No more auto-fixes available for ./$BICEP_FILE"
+                break
               fi
+              echo "Applied $FIXED fix(es) — re-validating..."
+            done
 
-              if [ -n "$MATCH" ]; then
-                MOD_INFO=$(resolve_module "$LINENUM")
-                MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
-                MOD_RES=$(echo "$MOD_INFO" | cut -f2)
-                echo "    RENAME: '$OLD_PROP' → '$MATCH' (line $LINENUM) in $MOD_NAME ($MOD_RES)"
-                sed -i "${LINENUM}s/^\([[:space:]]*\)${OLD_PROP}:/\1${MATCH}:/" "$BICEP_FILE"
-                echo "RENAME|${OLD_PROP}|${MATCH}|${LINENUM}|${MOD_NAME}|${MOD_RES}" >> "$FIX_LOG"
-                # Remove matched property from the missing list
-                grep -v "^${MATCH}$" /tmp/missing.txt > /tmp/missing_new.txt 2>/dev/null || true
-                mv /tmp/missing_new.txt /tmp/missing.txt
-                FIXED=$((FIXED + 1))
-              else
-                MOD_INFO=$(resolve_module "$LINENUM")
-                MOD_NAME=$(echo "$MOD_INFO" | cut -f1)
-                MOD_RES=$(echo "$MOD_INFO" | cut -f2)
-                echo "    COMMENT OUT: '$OLD_PROP' (line $LINENUM) in $MOD_NAME ($MOD_RES) — no replacement found"
-                sed -i "${LINENUM}s|^\([[:space:]]*\)\(.*\)|\1// [auto-removed] \2|" "$BICEP_FILE"
-                echo "REMOVE|${OLD_PROP}||${LINENUM}|${MOD_NAME}|${MOD_RES}" >> "$FIX_LOG"
-                FIXED=$((FIXED + 1))
-              fi
-            done < /tmp/removed.txt
-
-            # Log any remaining unresolved missing properties
-            while IFS= read -r MISS; do
-              [ -z "$MISS" ] && continue
-              if ! grep -q "UNRESOLVED|${MISS}|" "$FIX_LOG" 2>/dev/null; then
-                echo "    UNRESOLVED: missing required property '$MISS'"
-                echo "UNRESOLVED|${MISS}||" >> "$FIX_LOG"
-              fi
-            done < /tmp/missing.txt
-
-            echo "::endgroup::"
-
-            if [ "$FIXED" -eq 0 ]; then
-              echo "No more auto-fixes available"
-              break
-            fi
-            echo "Applied $FIXED fix(es) — re-validating..."
+            rm -f "$MODULE_INDEX"
           done
 
-          # Determine auto-fix outcome
-          FINAL_ERRORS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
-          FINAL_ERROR_COUNT=$(echo "$FINAL_ERRORS" | grep -c ' : Error ' || true)
+          # Determine auto-fix outcome across all files
+          FINAL_FAIL=0
+          for BICEP_FILE in $BICEP_FILES; do
+            ERRS=$(bicep build "$BICEP_FILE" --stdout 2>&1 >/dev/null) || true
+            CNT=$(echo "$ERRS" | grep -c ' : Error ' || true)
+            FINAL_FAIL=$((FINAL_FAIL + CNT))
+          done
 
-          if [ "$FINAL_ERROR_COUNT" -eq 0 ]; then
+          if [ "$FINAL_FAIL" -eq 0 ]; then
             echo "auto_fix_result=success" >> "$GITHUB_OUTPUT"
           else
             echo "auto_fix_result=partial" >> "$GITHUB_OUTPUT"
@@ -255,20 +265,30 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-          rm -f /tmp/bcp037.txt /tmp/bcp035.txt /tmp/removed.txt /tmp/missing.txt "$MODULE_INDEX"
+          rm -f /tmp/bcp037.txt /tmp/bcp035.txt /tmp/removed.txt /tmp/missing.txt
 
       # --- Final validation after auto-fix ---
       - name: Bicep Build (final)
         id: bicep-build
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
-        run: bicep build infra/main.bicep --stdout > /dev/null 2> build_errors.txt
+        run: |
+          > build_errors.txt
+          for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
+            bicep build "$f" --stdout > /dev/null 2>> build_errors.txt || true
+          done
+          [ ! -s build_errors.txt ]
 
       - name: Bicep Lint (final)
         id: bicep-lint
         if: steps.check.outputs.updates_found == 'true'
         continue-on-error: true
-        run: bicep lint infra/main.bicep 2> lint_errors.txt
+        run: |
+          > lint_errors.txt
+          for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
+            bicep lint "$f" 2>> lint_errors.txt || true
+          done
+          [ ! -s lint_errors.txt ]
 
       - name: Capture validation results
         id: validation
@@ -308,24 +328,28 @@ jobs:
           echo "build_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
           echo "lint_status=$LINT_STATUS" >> "$GITHUB_OUTPUT"
 
-          # Map error line numbers to module names
+          # Map error line numbers to module names (across all files)
           AFFECTED_MODULES=""
           if [ -f build_errors.txt ] || [ -f lint_errors.txt ]; then
-            ERROR_LINES=$(grep -ohP '\((\d+),' build_errors.txt lint_errors.txt 2>/dev/null | grep -oP '\d+' | sort -un)
-            MODULE_STARTS=$(grep -n '^module ' infra/main.bicep | sed 's/:module \([^ ]*\).*/:\1/')
+            for BICEP_FILE in $(find infra/ -name '*.bicep' -not -name '*.bicepparam'); do
+              FILE_ERRORS=$(grep "$BICEP_FILE" build_errors.txt lint_errors.txt 2>/dev/null || true)
+              ERROR_LINES=$(echo "$FILE_ERRORS" | grep -ohP '\(\d+,' | grep -oP '\d+' | sort -un)
+              MODULE_STARTS=$(grep -n '^module ' "$BICEP_FILE" 2>/dev/null | sed 's/:module \([^ ]*\).*/:\1/')
 
-            for ERR_LINE in $ERROR_LINES; do
-              MATCHED_MODULE=""
-              MATCHED_START=0
-              while IFS=: read -r MOD_LINE MOD_NAME; do
-                if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
-                  MATCHED_MODULE="$MOD_NAME"
-                  MATCHED_START=$MOD_LINE
+              for ERR_LINE in $ERROR_LINES; do
+                [ -z "$ERR_LINE" ] && continue
+                MATCHED_MODULE=""
+                MATCHED_START=0
+                while IFS=: read -r MOD_LINE MOD_NAME; do
+                  if [ "$ERR_LINE" -ge "$MOD_LINE" ] && [ "$MOD_LINE" -ge "$MATCHED_START" ]; then
+                    MATCHED_MODULE="$MOD_NAME"
+                    MATCHED_START=$MOD_LINE
+                  fi
+                done <<< "$MODULE_STARTS"
+                if [ -n "$MATCHED_MODULE" ]; then
+                  AFFECTED_MODULES="$AFFECTED_MODULES $MATCHED_MODULE"
                 fi
-              done <<< "$MODULE_STARTS"
-              if [ -n "$MATCHED_MODULE" ]; then
-                AFFECTED_MODULES="$AFFECTED_MODULES $MATCHED_MODULE"
-              fi
+              done
             done
             AFFECTED_MODULES=$(echo "$AFFECTED_MODULES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
           fi
@@ -351,34 +375,47 @@ jobs:
             echo '${{ steps.check.outputs.update_table }}'
             echo ''
 
-            # Auto-fix summary
+            # Auto-fix summary grouped by file
             if [ "$FIX_COUNT" != "0" ]; then
               echo '### Auto-Fix Summary'
               echo ''
               echo 'The following breaking changes were automatically resolved:'
               echo ''
-              echo '| Action | Module Name | Module Resource | Old Property | New Property | Line |'
-              echo '|--------|-------------|-----------------|-------------|--------------|------|'
-              while IFS='|' read -r ACTION OLD NEW LINE MOD_NAME MOD_RES; do
-                case "$ACTION" in
-                  RENAME)  echo "| Renamed | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | \`${NEW}\` | ${LINE} |" ;;
-                  REMOVE)  echo "| Commented out | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | — | ${LINE} |" ;;
-                esac
-              done <<< '${{ steps.autofix.outputs.fix_log }}'
-              echo ''
+              # Get unique file paths from fix log (7th field)
+              FIX_FILES=$(echo '${{ steps.autofix.outputs.fix_log }}' | grep '^RENAME\|^REMOVE' | awk -F'|' '{print $7}' | sort -u)
+              for FIX_FILE in $FIX_FILES; do
+                echo "#### ${FIX_FILE}"
+                echo ''
+                echo '| Action | Module Name | Module Resource | Old Property | New Property | Line |'
+                echo '|--------|-------------|-----------------|-------------|--------------|------|'
+                echo '${{ steps.autofix.outputs.fix_log }}' | while IFS='|' read -r ACTION OLD NEW LINE MOD_NAME MOD_RES FILE_PATH; do
+                  [ "$FILE_PATH" != "$FIX_FILE" ] && continue
+                  case "$ACTION" in
+                    RENAME)  echo "| Renamed | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | \`${NEW}\` | ${LINE} |" ;;
+                    REMOVE)  echo "| Commented out | \`${MOD_NAME}\` | \`${MOD_RES}\` | \`${OLD}\` | — | ${LINE} |" ;;
+                  esac
+                done
+                echo ''
+              done
             fi
 
-            # Unresolved items
+            # Unresolved items grouped by file
             UNRESOLVED=$(echo '${{ steps.autofix.outputs.fix_log }}' | grep '^UNRESOLVED' || true)
             if [ -n "$UNRESOLVED" ]; then
               echo '### Unresolved Changes'
               echo ''
               echo 'The following new required properties could not be auto-resolved:'
               echo ''
-              echo "$UNRESOLVED" | while IFS='|' read -r _ PROP _ _; do
-                echo "- \`${PROP}\`"
+              UNRESOLVED_FILES=$(echo "$UNRESOLVED" | awk -F'|' '{print $7}' | sort -u)
+              for UF in $UNRESOLVED_FILES; do
+                echo "#### ${UF}"
+                echo ''
+                echo "$UNRESOLVED" | while IFS='|' read -r _ PROP _ _ _ _ FILE_PATH; do
+                  [ "$FILE_PATH" != "$UF" ] && continue
+                  echo "- \`${PROP}\`"
+                done
+                echo ''
               done
-              echo ''
             fi
 
             if [ "$VALIDATION" = "success" ]; then
@@ -464,9 +501,9 @@ jobs:
             if (fixLog) {
               for (const line of fixLog.split('\n')) {
                 const parts = line.split('|');
-                if (parts[0] === 'RENAME')     renames.push({ old: parts[1], new: parts[2], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '' });
-                if (parts[0] === 'REMOVE')     removals.push({ old: parts[1], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '' });
-                if (parts[0] === 'UNRESOLVED') unresolved.push({ prop: parts[1] });
+                if (parts[0] === 'RENAME')     renames.push({ old: parts[1], new: parts[2], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '', file: parts[6] || '' });
+                if (parts[0] === 'REMOVE')     removals.push({ old: parts[1], line: parts[3], modName: parts[4] || '', modRes: parts[5] || '', file: parts[6] || '' });
+                if (parts[0] === 'UNRESOLVED') unresolved.push({ prop: parts[1], file: parts[6] || '' });
               }
             }
 
@@ -486,24 +523,35 @@ jobs:
               `| Bicep Lint | ${lintIcon} |`,
             ];
 
-            // Auto-fix changes
+            // Auto-fix changes grouped by file
             if (renames.length > 0 || removals.length > 0) {
               lines.push('', '### Auto-Fix Changes', '');
-              lines.push('| Action | Module Name | Module Resource | Old Property | New Property | Line |');
-              lines.push('|--------|-------------|-----------------|-------------|--------------|------|');
-              for (const r of renames) {
-                lines.push(`| Renamed | \`${r.modName}\` | \`${r.modRes}\` | \`${r.old}\` | \`${r.new}\` | ${r.line} |`);
-              }
-              for (const r of removals) {
-                lines.push(`| Commented out | \`${r.modName}\` | \`${r.modRes}\` | \`${r.old}\` | — | ${r.line} |`);
+              const allFixes = [
+                ...renames.map(r => ({ ...r, action: 'Renamed', newProp: r.new })),
+                ...removals.map(r => ({ ...r, action: 'Commented out', newProp: '—' }))
+              ];
+              const files = [...new Set(allFixes.map(f => f.file))].sort();
+              for (const file of files) {
+                lines.push(`#### ${file}`, '');
+                lines.push('| Action | Module Name | Module Resource | Old Property | New Property | Line |');
+                lines.push('|--------|-------------|-----------------|-------------|--------------|------|');
+                for (const f of allFixes.filter(f => f.file === file)) {
+                  lines.push(`| ${f.action} | \`${f.modName}\` | \`${f.modRes}\` | \`${f.old}\` | \`${f.newProp}\` | ${f.line} |`);
+                }
+                lines.push('');
               }
             }
 
-            // Unresolved
+            // Unresolved grouped by file
             if (unresolved.length > 0) {
               lines.push('', '### Unresolved — Needs Manual Fix', '');
-              for (const u of unresolved) {
-                lines.push(`- Missing required property: \`${u.prop}\``);
+              const uFiles = [...new Set(unresolved.map(u => u.file))].sort();
+              for (const file of uFiles) {
+                lines.push(`#### ${file}`, '');
+                for (const u of unresolved.filter(u => u.file === file)) {
+                  lines.push(`- Missing required property: \`${u.prop}\``);
+                }
+                lines.push('');
               }
             }
 

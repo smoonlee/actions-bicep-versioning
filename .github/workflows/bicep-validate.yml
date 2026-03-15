@@ -111,6 +111,24 @@ jobs:
           fi
           echo "affected_modules=$AFFECTED_MODULES" >> "$GITHUB_OUTPUT"
 
+          # Per-file validation status
+          > file_status.txt
+          for f in $(find infra/ -name '*.bicep' -not -name '*.bicepparam' | sort); do
+            FILE_BUILD="Passed"
+            FILE_LINT="Passed"
+            if grep -q "${f}.*: Error " build_errors.txt 2>/dev/null; then
+              FILE_BUILD="Failed"
+            elif grep -q "${f}.*: Warning " build_errors.txt 2>/dev/null; then
+              FILE_BUILD="Warning"
+            fi
+            if grep -q "${f}.*: Error " lint_errors.txt 2>/dev/null; then
+              FILE_LINT="Failed"
+            elif grep -q "${f}.*: Warning " lint_errors.txt 2>/dev/null; then
+              FILE_LINT="Warning"
+            fi
+            echo "${f}|${FILE_BUILD}|${FILE_LINT}" >> file_status.txt
+          done
+
       - name: Post validation comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v8
@@ -131,6 +149,9 @@ jobs:
             let lintErrors = '';
             try { lintErrors = stripPath(fs.readFileSync('lint_errors.txt', 'utf8').trim()); } catch {}
 
+            let fileStatus = '';
+            try { fileStatus = fs.readFileSync('file_status.txt', 'utf8').trim(); } catch {}
+
             const buildIcon = buildStatus === 'success' ? 'Passed' : 'Failed';
             const lintIcon = lintStatus === 'success' ? 'Passed' : 'Failed';
             const heading = result === 'success'
@@ -146,6 +167,16 @@ jobs:
               `| Bicep Build | ${buildIcon} |`,
               `| Bicep Lint | ${lintIcon} |`,
             ];
+
+            if (fileStatus) {
+              lines.push('', '### Per-File Validation', '', '| File | Build | Lint |', '|------|-------|------|');
+              fileStatus.split('\n').forEach(line => {
+                const parts = line.split('|');
+                if (parts.length >= 3) {
+                  lines.push(`| \`${parts[0]}\` | ${parts[1]} | ${parts[2]} |`);
+                }
+              });
+            }
 
             if (affectedModules && result !== 'success') {
               const modules = affectedModules.split(',');

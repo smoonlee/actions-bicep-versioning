@@ -36,7 +36,7 @@ param subnetName string = 'snet-learning-windows-${locationShortCode}'
 //
 // Azure Verified Modules
 
-module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.0' = {
+module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.3' = {
   name: 'createResourceGroup'
   params: {
     name: resourceGroupName
@@ -44,7 +44,7 @@ module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.0' = 
   }
 }
 
-module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-group:0.5.0' = {
+module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-group:0.5.2' = {
   name: 'createNetworkSecurityGroup'
   scope: resourceGroup(resourceGroupName)
   params: {
@@ -71,7 +71,7 @@ module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-gr
   ]
 }
 
-module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.5.1' = {
+module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.7.2' = {
   name: 'create-virtual-network'
   scope: resourceGroup(resourceGroupName)
   params: {
@@ -93,7 +93,7 @@ module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.5.1' = 
   ]
 }
 
-module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.8.0' = {
+module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.21.0' = {
   name: 'create-virtual-machine'
   scope: resourceGroup(resourceGroupName)
   params: {
@@ -103,7 +103,7 @@ module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.8.0' = 
     location: location
     osType: 'Windows'
     vmSize: 'Standard_B2ms'
-    zone: 0
+    availabilityZone: 0
     bootDiagnostics: true
     secureBootEnabled: true
     encryptionAtHost: true

@@ -65,7 +65,7 @@ module createResourceGroup 'br/public:avm/res/resources/resource-group:0.4.4' = 
   }
 }
 
-module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-group:0.5.3' = {
+module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-group:0.5.4' = {
   name: 'createNetworkSecurityGroup'
   scope: resourceGroup(resourceGroupName)
   params: {
@@ -92,7 +92,7 @@ module createNetworkSecurityGroup 'br/public:avm/res/network/network-security-gr
   ]
 }
 
-module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.10.1' = {
+module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.10.2' = {
   name: 'create-virtual-network'
   scope: resourceGroup(resourceGroupName)
   params: {
@@ -114,7 +114,7 @@ module createVirtualNetwork 'br/public:avm/res/network/virtual-network:0.10.1' =
   ]
 }
 
-module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.22.2' = {
+module createVirtualMachine 'br/public:avm/res/compute/virtual-machine:0.22.3' = {
   name: 'create-virtual-machine'
   scope: resourceGroup(resourceGroupName)
   params: {

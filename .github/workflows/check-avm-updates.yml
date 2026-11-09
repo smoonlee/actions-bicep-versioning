@@ -156,8 +156,11 @@ jobs:
       - name: Install Bicep CLI
         if: steps.check.outputs.updates_found == 'true'
         run: |
-          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 15 --max-time 120 \
+            --output bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
           chmod +x bicep
+          ./bicep --version
           sudo mv bicep /usr/local/bin/bicep
           bicep --version
 
